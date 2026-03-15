@@ -1,0 +1,27 @@
+agent_id = "agt_dev_local"
+org_id = "org_dev"
+token = "bw_test_token_for_local_development_0123456789abcdef0123456789abcdef"
+api_url = "http://localhost:9800"
+
+[collection]
+metrics_interval_seconds = 1
+
+[[alerts.rules]]
+id = "rule_001"
+name = "High CPU"
+type = "metric"
+metric = "cpu_percent"
+operator = ">"
+threshold = 90.0
+duration_seconds = 10
+channels = ["terminal"]
+
+[[alerts.rules]]
+id = "rule_002"
+name = "High Memory"
+type = "metric"
+metric = "memory_percent"
+operator = ">"
+threshold = 85.0
+duration_seconds = 5
+channels = ["terminal"]

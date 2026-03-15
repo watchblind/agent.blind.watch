@@ -1,0 +1,28 @@
+# Compiled binaries
+blind-watch-agent
+blindwatch-agent
+*.exe
+/dist/
+
+# Agent state and keys (created at runtime)
+state.json
+nonce_state.json
+agent-key
+*.wal
+
+# Provisioning files with credentials
+provision-*.json
+
+# Environment files
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
