@@ -61,7 +61,7 @@ changelog:
 release:
   github:
     owner: watchblind
-    name: agent
+    name: agent.blind.watch
   draft: false
   prerelease: auto
   name_template: "v{{.Version}}"

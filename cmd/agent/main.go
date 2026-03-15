@@ -38,10 +38,7 @@ var (
 func main() {
 	// --- Memory and security limits ---
 	debug.SetMemoryLimit(50 * 1024 * 1024) // 50 MB GOMEMLIMIT per spec
-
-	// Disable core dumps to prevent DEK from being written to disk
-	var rlimit syscall.Rlimit
-	syscall.Setrlimit(syscall.RLIMIT_CORE, &rlimit) // {Cur: 0, Max: 0}
+	// Core dump disabling is in security_linux.go (build-tagged)
 
 	// --- Flags ---
 	showVersion := flag.Bool("version", false, "print version and exit")
