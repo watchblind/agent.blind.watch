@@ -31,6 +31,7 @@ type ProcessCollector struct {
 	prevIORead  map[int32]uint64
 	prevIOWrite map[int32]uint64
 	prevTime    time.Time
+	lastInfos   []ProcessInfo
 }
 
 func NewProcessCollector(maxProcs int) *ProcessCollector {
@@ -70,6 +71,9 @@ func (c *ProcessCollector) Collect(ctx context.Context) ([]Metric, error) {
 		infos = infos[:c.maxProcs]
 	}
 
+	// Store for snapshot inclusion
+	c.lastInfos = infos
+
 	now := time.Now()
 	var metrics []Metric
 
@@ -87,6 +91,11 @@ func (c *ProcessCollector) Collect(ctx context.Context) ([]Metric, error) {
 	})
 
 	return metrics, nil
+}
+
+// LastInfos returns the process list from the most recent Collect() call.
+func (c *ProcessCollector) LastInfos() []ProcessInfo {
+	return c.lastInfos
 }
 
 // CollectProcesses returns detailed process info for the dashboard.
