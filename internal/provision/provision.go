@@ -216,47 +216,64 @@ func FirstBoot(input *ProvisionInput, dataDir string) (dek []byte, state *State,
 	if err := saveState(dataDir, state, kp.Private[:]); err != nil {
 		return nil, nil, fmt.Errorf("saving state: %w", err)
 	}
+
+	// Save raw DEK to disk so SubsequentBoot can skip the server roundtrip
+	dekPath := filepath.Join(dataDir, "dek.key")
+	if err := os.WriteFile(dekPath, dek, 0600); err != nil {
+		return nil, nil, fmt.Errorf("writing DEK: %w", err)
+	}
 	fmt.Printf("[provision] state saved to %s\n", dataDir)
 
 	// Provisioning secret is NOT saved — it's gone after this function returns
 	return dek, state, nil
 }
 
-// SubsequentBoot loads saved state and recovers the DEK from the server.
+// SubsequentBoot loads saved state and recovers the DEK.
+// It first tries the local dek.key file (written during FirstBoot),
+// falling back to fetching the wrapped DEK from the server.
 func SubsequentBoot(dataDir string) (dek []byte, state *State, err error) {
-	// Load saved state (need api_url to check HTTPS before any network call)
+	// Load saved state
 	state, err = LoadState(dataDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading state: %w", err)
 	}
 
+	// Fast path: load raw DEK from local disk
+	dekPath := filepath.Join(dataDir, "dek.key")
+	if localDEK, readErr := os.ReadFile(dekPath); readErr == nil && len(localDEK) == 32 {
+		fmt.Println("[provision] loaded DEK from local cache")
+		return localDEK, state, nil
+	}
+
+	// Slow path: fetch wrapped DEK from server and unwrap
+	fmt.Println("[provision] local DEK not found, fetching from server...")
+
 	if err := requireHTTPS(state.APIURL); err != nil {
 		return nil, nil, err
 	}
 
-	// Decode agent_secret
 	agentSecret, err := base64.StdEncoding.DecodeString(state.AgentSecret)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decoding agent_secret: %w", err)
 	}
 
-	// Derive agent_key
 	agentKey, err := crypto.DeriveKey(agentSecret, state.AgentID, "agent-key")
 	if err != nil {
 		return nil, nil, fmt.Errorf("deriving agent_key: %w", err)
 	}
 
-	// Fetch wrapped DEK from server
 	wrappedDEK, epoch, err := FetchAgentDEK(state.APIURL, state.Token)
 	if err != nil {
 		return nil, nil, fmt.Errorf("fetching agent DEK: %w", err)
 	}
 
-	// Unwrap DEK
 	dek, err = crypto.UnwrapKey(wrappedDEK, agentKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unwrapping DEK: %w", err)
 	}
+
+	// Cache DEK locally for next boot
+	_ = os.WriteFile(dekPath, dek, 0600)
 
 	state.Epoch = epoch
 	return dek, state, nil
@@ -355,7 +372,7 @@ func FetchAgentDEK(apiURL, token string) (wrappedDEK string, epoch int, err erro
 		return "", 0, err
 	}
 
-	req, _ := http.NewRequest("GET", apiURL+"/v1/keys/agent-dek", nil)
+	req, _ := http.NewRequest("GET", apiURL+"/v1/agent/dek", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := httpClient.Do(req)

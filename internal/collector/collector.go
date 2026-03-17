@@ -19,9 +19,25 @@ type Collector interface {
 	Collect(ctx context.Context) ([]Metric, error)
 }
 
+// ProcessProvider is optionally implemented by collectors that produce process lists.
+type ProcessProvider interface {
+	LastInfos() []ProcessInfo
+}
+
+// ProcessSnapshot is the per-process data included in each snapshot.
+// Field names use snake_case JSON tags to match the dashboard's expected format.
+type ProcessSnapshot struct {
+	PID        int32   `json:"pid"`
+	Name       string  `json:"name"`
+	CPUPercent float64 `json:"cpu_percent"`
+	MemoryMB   float64 `json:"memory_mb"`
+	User       string  `json:"user"`
+}
+
 type Snapshot struct {
-	Metrics   []Metric  `json:"metrics"`
-	Timestamp time.Time `json:"timestamp"`
+	Metrics   []Metric          `json:"metrics"`
+	Timestamp time.Time         `json:"timestamp"`
+	Processes []ProcessSnapshot `json:"processes,omitempty"`
 }
 
 type Orchestrator struct {
@@ -83,9 +99,26 @@ func (o *Orchestrator) collect(ctx context.Context) {
 		all = append(all, metrics...)
 	}
 
+	// Extract process list from any collector that provides it
+	var processes []ProcessSnapshot
+	for _, c := range o.collectors {
+		if pp, ok := c.(ProcessProvider); ok {
+			for _, info := range pp.LastInfos() {
+				processes = append(processes, ProcessSnapshot{
+					PID:        info.PID,
+					Name:       info.Name,
+					CPUPercent: info.CPU,
+					MemoryMB:   float64(info.MemRSS) / (1024 * 1024),
+					User:       info.User,
+				})
+			}
+		}
+	}
+
 	snap := Snapshot{
 		Metrics:   all,
 		Timestamp: now,
+		Processes: processes,
 	}
 
 	o.mu.Lock()

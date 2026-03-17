@@ -23,10 +23,11 @@ const (
 	ModeLive
 )
 
-// Snapshot is a timestamped collection of metrics, serializable for encryption.
+// Snapshot is a timestamped collection of metrics and processes, serializable for encryption.
 type Snapshot struct {
-	Timestamp int64              `json:"timestamp"`
-	Metrics   []collector.Metric `json:"metrics"`
+	Timestamp int64                      `json:"timestamp"`
+	Metrics   []collector.Metric         `json:"metrics"`
+	Processes []collector.ProcessSnapshot `json:"processes,omitempty"`
 }
 
 // Scheduler orchestrates metric collection, batching, encryption, and sending.
@@ -238,6 +239,7 @@ func (s *Scheduler) collect(ctx context.Context) *Snapshot {
 	return &Snapshot{
 		Timestamp: time.Now().Unix(),
 		Metrics:   latest.Metrics,
+		Processes: latest.Processes,
 	}
 }
 
