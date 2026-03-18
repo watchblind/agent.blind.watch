@@ -207,11 +207,23 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 			return
 
 		case <-s.paceChanged:
-			// Pace changed — reset collect ticker immediately
+			// Pace changed — reset collect ticker and flush buffered data
 			s.mu.RLock()
 			newInterval := s.collectInterval
+			newMode := s.mode
 			s.mu.RUnlock()
 			collectTicker.Reset(newInterval)
+
+			// When switching to live mode:
+			// 1. Send all buffered idle-mode snapshots as individual live messages
+			// 2. Immediately collect+send a fresh snapshot so the dashboard
+			//    gets data without waiting for the next ticker (up to 10s delay)
+			if newMode == ModeLive {
+				s.flushBufferAsLive()
+				if snap := s.collect(ctx); snap != nil {
+					s.sendLive(snap)
+				}
+			}
 
 		case <-collectTicker.C:
 			snap := s.collect(ctx)
@@ -390,6 +402,25 @@ func (s *Scheduler) sendLive(snap *Snapshot) {
 				})
 			}
 		}
+	}
+}
+
+// flushBufferAsLive drains the batch buffer and sends each snapshot as an
+// individual "live" message. Called on idle→live transition so the dashboard
+// receives every buffered point in the same format as real-time data.
+func (s *Scheduler) flushBufferAsLive() {
+	s.batchMu.Lock()
+	snapshots := s.batchBuf
+	s.batchBuf = nil
+	s.batchMu.Unlock()
+
+	if len(snapshots) == 0 {
+		return
+	}
+
+	log.Printf("[scheduler] flushing %d buffered snapshots as live", len(snapshots))
+	for i := range snapshots {
+		s.sendLive(&snapshots[i])
 	}
 }
 
