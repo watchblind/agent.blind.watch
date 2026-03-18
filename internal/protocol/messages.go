@@ -107,6 +107,27 @@ type ErrorMessage struct {
 	RetryAfter int    `json:"retry_after,omitempty"`
 }
 
+// --- Log messages ---
+
+type LogBatchEntry struct {
+	Timestamp  int64  `json:"timestamp"`
+	EncPayload string `json:"enc_payload"`
+}
+
+type LogBatchMessage struct {
+	Type    string          `json:"type"` // "log_batch"
+	BatchID string          `json:"batch_id"`
+	Epoch   int             `json:"epoch"`
+	Entries []LogBatchEntry `json:"entries"`
+}
+
+type LiveLogMessage struct {
+	Type       string `json:"type"` // "live_log"
+	Epoch      int    `json:"epoch"`
+	Timestamp  int64  `json:"timestamp"`
+	EncPayload string `json:"enc_payload"`
+}
+
 // Envelope is used for initial JSON parsing to determine message type.
 type Envelope struct {
 	Type string `json:"type"`
