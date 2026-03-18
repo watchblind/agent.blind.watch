@@ -18,6 +18,7 @@ import (
 // Encryptor handles AES-256-GCM encryption with deterministic nonces per spec.
 type Encryptor struct {
 	aead       cipher.AEAD
+	dek        []byte // retained so we can zero it on shutdown
 	clientHash [4]byte
 	agentID    string
 	nonce      *NonceManager
@@ -135,8 +136,12 @@ func NewEncryptorWithKey(dek []byte) (*Encryptor, error) {
 
 	nm, _ := newNonceManager("")
 
+	dekCopy := make([]byte, len(dek))
+	copy(dekCopy, dek)
+
 	return &Encryptor{
 		aead:       aead,
+		dek:        dekCopy,
 		clientHash: clientHash,
 		agentID:    "",
 		nonce:      nm,
@@ -163,8 +168,12 @@ func NewEncryptorWithConfig(dek []byte, agentID string, dataDir string) (*Encryp
 		return nil, fmt.Errorf("initializing nonce manager: %w", err)
 	}
 
+	dekCopy := make([]byte, len(dek))
+	copy(dekCopy, dek)
+
 	return &Encryptor{
 		aead:       aead,
+		dek:        dekCopy,
 		clientHash: clientHash,
 		agentID:    agentID,
 		nonce:      nm,
@@ -233,6 +242,14 @@ func (e *Encryptor) Decrypt(encoded string) ([]byte, error) {
 // NonceSize returns the nonce size used by the AEAD.
 func (e *Encryptor) NonceSize() int {
 	return e.aead.NonceSize()
+}
+
+// ZeroDEK overwrites the Encryptor's internal DEK buffer with zeros.
+// Must be called on graceful shutdown and on SIGTERM/SIGINT per spec.
+func (e *Encryptor) ZeroDEK() {
+	for i := range e.dek {
+		e.dek[i] = 0
+	}
 }
 
 // buildAAD constructs associated data from agentID and the timestamp in the nonce.
