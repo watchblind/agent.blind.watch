@@ -20,6 +20,7 @@ import (
 	"github.com/watchblind/agent/internal/config"
 	"github.com/watchblind/agent/internal/crypto"
 	"github.com/watchblind/agent/internal/dashboard"
+	"github.com/watchblind/agent/internal/logtail"
 	"github.com/watchblind/agent/internal/protocol"
 	"github.com/watchblind/agent/internal/provision"
 	"github.com/watchblind/agent/internal/scheduler"
@@ -203,6 +204,12 @@ func main() {
 	// Initialize scheduler
 	sched := scheduler.New(agentID, epoch, enc, orch, conn, w)
 
+	// Initialize log manager
+	logMgr, err := logtail.NewManager(agentID, *dataDir, enc, epoch, conn, w)
+	if err != nil {
+		log.Fatalf("Failed to init log manager: %v", err)
+	}
+
 	// Wire callbacks
 	conn.OnAck(func(batchID string) {
 		sched.AckBatch(batchID)
@@ -210,6 +217,10 @@ func main() {
 
 	conn.OnPace(func(intervalMS, collectMS int) {
 		sched.SetPace(intervalMS, collectMS)
+		// Flush buffered logs when switching to live mode (dashboard connected)
+		if intervalMS > 0 {
+			logMgr.FlushNow()
+		}
 	})
 
 	// Config push from server — decrypt E2E encrypted config, then apply
@@ -236,6 +247,7 @@ func main() {
 			Collection struct {
 				IntervalSeconds int `json:"interval_seconds"`
 			} `json:"collection"`
+			LogSources []logtail.LogSourceConfig `json:"log_sources"`
 		}
 		if err := json.Unmarshal(plaintext, &cfg); err != nil {
 			log.Printf("[agent] failed to parse decrypted config: %v", err)
@@ -249,6 +261,11 @@ func main() {
 			}
 			eval.UpdateRules(cfg.Alerts.Rules)
 			log.Printf("[agent] updated %d alert rules from server", len(cfg.Alerts.Rules))
+		}
+
+		if cfg.LogSources != nil {
+			logMgr.UpdateConfig(cfg.LogSources)
+			log.Printf("[agent] updated %d log sources from server", len(cfg.LogSources))
 		}
 	})
 
@@ -312,6 +329,7 @@ func main() {
 		oldEnc.ZeroDEK()
 
 		sched.SetEncryptor(newEnc, newEpoch)
+		logMgr.SetEncryptor(newEnc, newEpoch)
 		log.Printf("[agent] DEK rotation complete: now using epoch %d", newEpoch)
 	})
 
@@ -370,6 +388,7 @@ func main() {
 		go orch.Run(ctx, interval)
 		go conn.Run(ctx)
 		go sched.Run(ctx)
+		go logMgr.Run(ctx)
 
 		dash := dashboard.New(snapCh, alertCh, eval.States(), snd, procCol)
 		if err := dash.Run(); err != nil {
@@ -384,6 +403,7 @@ func main() {
 		go orch.Run(ctx, interval)
 		go conn.Run(ctx)
 		go sched.Run(ctx)
+		go logMgr.Run(ctx)
 
 		fmt.Printf("\nAgent running (WebSocket mode). Press Ctrl+C to stop.\n")
 		fmt.Printf("  WAL entries: %d pending\n", w.Count())
