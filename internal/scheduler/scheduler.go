@@ -30,6 +30,18 @@ type Snapshot struct {
 	Processes []collector.ProcessSnapshot `json:"processes,omitempty"`
 }
 
+// MetricPayload is the metrics-only portion sent as type "live" / "batch".
+type MetricPayload struct {
+	Timestamp int64              `json:"timestamp"`
+	Metrics   []collector.Metric `json:"metrics"`
+}
+
+// ProcessPayload is the process-only portion sent as type "live_proc" / "batch_proc".
+type ProcessPayload struct {
+	Timestamp int64                      `json:"timestamp"`
+	Processes []collector.ProcessSnapshot `json:"processes"`
+}
+
 // Scheduler orchestrates metric collection, batching, encryption, and sending.
 // In idle mode: collects every collectInterval, batches and sends every batchInterval (clock-aligned).
 // In live mode: collects and sends every collectInterval (1s).
@@ -259,52 +271,84 @@ func (s *Scheduler) sendBatch() {
 		return
 	}
 
-	// Snapshot encryptor and epoch under lock (may change during DEK rotation)
 	s.mu.RLock()
 	enc := s.encryptor
 	epoch := s.epoch
 	s.mu.RUnlock()
 
 	now := time.Now()
-	batchID := fmt.Sprintf("b_%d_%s", now.Unix(), s.agentID)
 
-	plaintext, err := json.Marshal(snapshots)
-	if err != nil {
-		log.Printf("[scheduler] marshal batch error: %v", err)
-		return
+	// --- Metrics batch (strip processes) ---
+	metricBatchID := fmt.Sprintf("b_%d_%s", now.Unix(), s.agentID)
+	metricPayloads := make([]MetricPayload, len(snapshots))
+	for i, snap := range snapshots {
+		metricPayloads[i] = MetricPayload{
+			Timestamp: snap.Timestamp,
+			Metrics:   snap.Metrics,
+		}
 	}
 
-	encrypted, err := enc.Encrypt(plaintext)
-	if err != nil {
-		log.Printf("[scheduler] encrypt batch error: %v", err)
-		return
-	}
+	if plaintext, err := json.Marshal(metricPayloads); err == nil {
+		if encrypted, err := enc.Encrypt(plaintext); err == nil {
+			walEntry := wal.Entry{
+				BatchID:    metricBatchID,
+				AgentID:    s.agentID,
+				Epoch:      epoch,
+				Timestamp:  now.Unix(),
+				EncPayload: encrypted,
+			}
+			if err := s.wal.Append(walEntry); err != nil {
+				log.Printf("[scheduler] WAL append error: %v", err)
+			}
 
-	walEntry := wal.Entry{
-		BatchID:    batchID,
-		AgentID:    s.agentID,
-		Epoch:      epoch,
-		Timestamp:  now.Unix(),
-		EncPayload: encrypted,
-	}
-
-	if err := s.wal.Append(walEntry); err != nil {
-		log.Printf("[scheduler] WAL append error: %v", err)
-	}
-
-	msg := protocol.BatchMessage{
-		Type:       "batch",
-		BatchID:    batchID,
-		Epoch:      epoch,
-		Timestamp:  now.Unix(),
-		EncPayload: encrypted,
-	}
-
-	if err := s.conn.Send(msg); err != nil {
-		log.Printf("[scheduler] batch send error: %v (data preserved in WAL)", err)
+			if err := s.conn.Send(protocol.BatchMessage{
+				Type:       "batch",
+				BatchID:    metricBatchID,
+				Epoch:      epoch,
+				Timestamp:  now.Unix(),
+				EncPayload: encrypted,
+			}); err != nil {
+				log.Printf("[scheduler] metric batch send error: %v (data in WAL)", err)
+			} else {
+				log.Printf("[scheduler] metric batch sent: %s (%d snapshots, %d bytes)",
+					metricBatchID, len(snapshots), len(encrypted))
+			}
+		} else {
+			log.Printf("[scheduler] encrypt metric batch error: %v", err)
+		}
 	} else {
-		log.Printf("[scheduler] batch sent: %s (%d snapshots, %d bytes encrypted)",
-			batchID, len(snapshots), len(encrypted))
+		log.Printf("[scheduler] marshal metric batch error: %v", err)
+	}
+
+	// --- Process batch (collect all process data) ---
+	var procPayloads []ProcessPayload
+	for _, snap := range snapshots {
+		if len(snap.Processes) > 0 {
+			procPayloads = append(procPayloads, ProcessPayload{
+				Timestamp: snap.Timestamp,
+				Processes: snap.Processes,
+			})
+		}
+	}
+
+	if len(procPayloads) > 0 {
+		procBatchID := fmt.Sprintf("bp_%d_%s", now.Unix(), s.agentID)
+		if plaintext, err := json.Marshal(procPayloads); err == nil {
+			if encrypted, err := enc.Encrypt(plaintext); err == nil {
+				if err := s.conn.Send(protocol.BatchProcMessage{
+					Type:       "batch_proc",
+					BatchID:    procBatchID,
+					Epoch:      epoch,
+					Timestamp:  now.Unix(),
+					EncPayload: encrypted,
+				}); err != nil {
+					log.Printf("[scheduler] process batch send error: %v", err)
+				} else {
+					log.Printf("[scheduler] process batch sent: %s (%d snapshots, %d bytes)",
+						procBatchID, len(procPayloads), len(encrypted))
+				}
+			}
+		}
 	}
 }
 
@@ -314,24 +358,39 @@ func (s *Scheduler) sendLive(snap *Snapshot) {
 	epoch := s.epoch
 	s.mu.RUnlock()
 
-	plaintext, err := json.Marshal(snap)
-	if err != nil {
-		return
+	// Send metrics payload
+	metricPayload := MetricPayload{
+		Timestamp: snap.Timestamp,
+		Metrics:   snap.Metrics,
+	}
+	if plaintext, err := json.Marshal(metricPayload); err == nil {
+		if encrypted, err := enc.Encrypt(plaintext); err == nil {
+			s.conn.Send(protocol.LiveMessage{
+				Type:       "live",
+				Epoch:      epoch,
+				Timestamp:  snap.Timestamp,
+				EncPayload: encrypted,
+			})
+		}
 	}
 
-	encrypted, err := enc.Encrypt(plaintext)
-	if err != nil {
-		return
+	// Send process payload separately (if present)
+	if len(snap.Processes) > 0 {
+		procPayload := ProcessPayload{
+			Timestamp: snap.Timestamp,
+			Processes: snap.Processes,
+		}
+		if plaintext, err := json.Marshal(procPayload); err == nil {
+			if encrypted, err := enc.Encrypt(plaintext); err == nil {
+				s.conn.Send(protocol.LiveProcMessage{
+					Type:       "live_proc",
+					Epoch:      epoch,
+					Timestamp:  snap.Timestamp,
+					EncPayload: encrypted,
+				})
+			}
+		}
 	}
-
-	msg := protocol.LiveMessage{
-		Type:       "live",
-		Epoch:      epoch,
-		Timestamp:  snap.Timestamp,
-		EncPayload: encrypted,
-	}
-
-	s.conn.Send(msg)
 }
 
 // flush encrypts and sends any buffered data. Called on graceful shutdown.
@@ -351,41 +410,70 @@ func (s *Scheduler) flush() {
 	s.mu.RUnlock()
 
 	now := time.Now()
-	batchID := fmt.Sprintf("flush_%d_%s", now.Unix(), s.agentID)
 
-	plaintext, err := json.Marshal(snapshots)
-	if err != nil {
-		log.Printf("[scheduler] flush marshal error: %v", err)
-		return
+	// Flush metrics
+	metricBatchID := fmt.Sprintf("flush_%d_%s", now.Unix(), s.agentID)
+	metricPayloads := make([]MetricPayload, len(snapshots))
+	for i, snap := range snapshots {
+		metricPayloads[i] = MetricPayload{
+			Timestamp: snap.Timestamp,
+			Metrics:   snap.Metrics,
+		}
 	}
 
-	encrypted, err := enc.Encrypt(plaintext)
-	if err != nil {
-		log.Printf("[scheduler] flush encrypt error: %v", err)
-		return
-	}
+	if plaintext, err := json.Marshal(metricPayloads); err == nil {
+		if encrypted, err := enc.Encrypt(plaintext); err == nil {
+			walEntry := wal.Entry{
+				BatchID:    metricBatchID,
+				AgentID:    s.agentID,
+				Epoch:      epoch,
+				Timestamp:  now.Unix(),
+				EncPayload: encrypted,
+			}
+			s.wal.Append(walEntry)
 
-	walEntry := wal.Entry{
-		BatchID:    batchID,
-		AgentID:    s.agentID,
-		Epoch:      epoch,
-		Timestamp:  now.Unix(),
-		EncPayload: encrypted,
-	}
-	s.wal.Append(walEntry)
-
-	msg := protocol.FlushMessage{
-		Type:       "flush",
-		BatchID:    batchID,
-		Epoch:      epoch,
-		Timestamp:  now.Unix(),
-		EncPayload: encrypted,
-	}
-
-	if err := s.conn.SendSync(msg); err != nil {
-		log.Printf("[scheduler] flush send failed: %v (data preserved in WAL)", err)
+			if err := s.conn.SendSync(protocol.FlushMessage{
+				Type:       "flush",
+				BatchID:    metricBatchID,
+				Epoch:      epoch,
+				Timestamp:  now.Unix(),
+				EncPayload: encrypted,
+			}); err != nil {
+				log.Printf("[scheduler] flush send failed: %v (data in WAL)", err)
+			} else {
+				log.Printf("[scheduler] flush sent: %s (%d snapshots)", metricBatchID, len(snapshots))
+			}
+		} else {
+			log.Printf("[scheduler] flush encrypt error: %v", err)
+		}
 	} else {
-		log.Printf("[scheduler] flush sent: %s (%d snapshots)", batchID, len(snapshots))
+		log.Printf("[scheduler] flush marshal error: %v", err)
+	}
+
+	// Flush processes (no WAL — process data is ephemeral)
+	var procPayloads []ProcessPayload
+	for _, snap := range snapshots {
+		if len(snap.Processes) > 0 {
+			procPayloads = append(procPayloads, ProcessPayload{
+				Timestamp: snap.Timestamp,
+				Processes: snap.Processes,
+			})
+		}
+	}
+
+	if len(procPayloads) > 0 {
+		procBatchID := fmt.Sprintf("flushp_%d_%s", now.Unix(), s.agentID)
+		if plaintext, err := json.Marshal(procPayloads); err == nil {
+			if encrypted, err := enc.Encrypt(plaintext); err == nil {
+				s.conn.SendSync(protocol.BatchProcMessage{
+					Type:       "batch_proc",
+					BatchID:    procBatchID,
+					Epoch:      epoch,
+					Timestamp:  now.Unix(),
+					EncPayload: encrypted,
+				})
+			}
+		}
 	}
 }
 

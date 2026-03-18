@@ -40,6 +40,21 @@ type FlushMessage struct {
 	EncPayload string `json:"enc_payload"`
 }
 
+type LiveProcMessage struct {
+	Type       string `json:"type"` // "live_proc"
+	Epoch      int    `json:"epoch"`
+	Timestamp  int64  `json:"timestamp"`
+	EncPayload string `json:"enc_payload"`
+}
+
+type BatchProcMessage struct {
+	Type       string `json:"type"` // "batch_proc"
+	BatchID    string `json:"batch_id"`
+	Epoch      int    `json:"epoch"`
+	Timestamp  int64  `json:"timestamp"`
+	EncPayload string `json:"enc_payload"`
+}
+
 type AlertMessage struct {
 	Type            string `json:"type"` // "alert"
 	Epoch           int    `json:"epoch"`
