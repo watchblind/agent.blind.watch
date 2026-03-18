@@ -159,7 +159,14 @@ func (c *ProcessCollector) collectOne(ctx context.Context, p *process.Process) *
 		statusStr = status[0]
 	}
 
-	user, _ := p.UsernameWithContext(ctx)
+	user, err := p.UsernameWithContext(ctx)
+	if err != nil || user == "" {
+		// Fallback to numeric UID string when username lookup fails
+		uids, uidErr := p.UidsWithContext(ctx)
+		if uidErr == nil && len(uids) > 0 {
+			user = fmt.Sprintf("%d", uids[0])
+		}
+	}
 
 	threads, _ := p.NumThreadsWithContext(ctx)
 
