@@ -3,11 +3,16 @@ package collector
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sort"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/process"
 )
+
+// numCPU is the logical CPU count used to normalize per-process CPU
+// from per-core (0-N*100%) to system-wide (0-100%).
+var numCPU = float64(runtime.NumCPU())
 
 // ProcessInfo holds per-process metrics similar to btop.
 type ProcessInfo struct {
@@ -144,7 +149,10 @@ func (c *ProcessCollector) collectOne(ctx context.Context, p *process.Process) *
 		return nil
 	}
 
-	cpuPct, _ := p.CPUPercentWithContext(ctx)
+	cpuPctRaw, _ := p.CPUPercentWithContext(ctx)
+	// gopsutil returns per-core percentage (0-100% per core).
+	// Normalize to system-wide percentage (0-100% of all cores).
+	cpuPct := cpuPctRaw / numCPU
 
 	memInfo, err := p.MemoryInfoWithContext(ctx)
 	if err != nil {
