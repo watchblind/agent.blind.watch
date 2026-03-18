@@ -307,6 +307,10 @@ func main() {
 			newDEK[i] = 0
 		}
 
+		// Zero the old encryptor's DEK before replacing it
+		oldEnc, _ := sched.EncryptorAndEpoch()
+		oldEnc.ZeroDEK()
+
 		sched.SetEncryptor(newEnc, newEpoch)
 		log.Printf("[agent] DEK rotation complete: now using epoch %d", newEpoch)
 	})
@@ -372,6 +376,10 @@ func main() {
 			log.Fatalf("Dashboard error: %v", err)
 		}
 		cancel()
+
+		// Zero the DEK from the current encryptor per spec
+		currentEnc, _ := sched.EncryptorAndEpoch()
+		currentEnc.ZeroDEK()
 	} else {
 		go orch.Run(ctx, interval)
 		go conn.Run(ctx)
@@ -382,6 +390,10 @@ func main() {
 		<-sigCh
 		fmt.Println("\nShutting down gracefully...")
 		cancel()
+
+		// Zero the DEK from the current encryptor per spec
+		currentEnc, _ := sched.EncryptorAndEpoch()
+		currentEnc.ZeroDEK()
 
 		time.Sleep(500 * time.Millisecond)
 	}
