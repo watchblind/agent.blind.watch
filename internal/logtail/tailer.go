@@ -71,18 +71,18 @@ func (t *Tailer) readNewLines() {
 		return
 	}
 
-	offset := t.store.Get(t.key)
-	if info.Size() < offset {
+	pos, _ := t.store.Get(t.key)
+	if info.Size() < pos.Offset {
 		// File was truncated — start from beginning
-		offset = 0
+		pos = FilePosition{}
 		log.Printf("[logtail] file truncated, resetting position: %s", t.cfg.Path)
 	}
 
-	if info.Size() == offset {
+	if info.Size() == pos.Offset {
 		return // no new data
 	}
 
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+	if _, err := f.Seek(pos.Offset, io.SeekStart); err != nil {
 		return
 	}
 
@@ -102,5 +102,5 @@ func (t *Tailer) readNewLines() {
 
 	// Update position
 	newOffset, _ := f.Seek(0, io.SeekCurrent)
-	t.store.Set(t.key, newOffset)
+	t.store.Set(t.key, FilePosition{Offset: newOffset})
 }
