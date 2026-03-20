@@ -126,18 +126,19 @@ func (c *Connection) Send(msg interface{}) error {
 }
 
 // SendSync sends a message and blocks until it's written to the WebSocket.
+// Routes through sendCh to avoid concurrent writes with writePump.
 func (c *Connection) SendSync(msg interface{}) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
 
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-	if c.conn == nil {
-		return fmt.Errorf("not connected")
+	select {
+	case c.sendCh <- data:
+		return nil
+	case <-c.stopCh:
+		return fmt.Errorf("connection closed")
 	}
-	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // Close gracefully closes the connection.
@@ -229,12 +230,13 @@ func (c *Connection) writePump(ctx context.Context) {
 			}
 
 			c.connMu.Lock()
-			conn := c.conn
-			c.connMu.Unlock()
-			if conn == nil {
+			if c.conn == nil {
+				c.connMu.Unlock()
 				return
 			}
-			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			err := c.conn.WriteMessage(websocket.TextMessage, data)
+			c.connMu.Unlock()
+			if err != nil {
 				return
 			}
 		}
@@ -289,7 +291,16 @@ func (c *Connection) handleMessage(data []byte) {
 		var msg protocol.ErrorMessage
 		if json.Unmarshal(data, &msg) == nil {
 			log.Printf("[ws] server error: code=%s retry_after=%d", msg.Code, msg.RetryAfter)
-			if msg.RetryAfter > 0 {
+			if msg.Code == "RATE_LIMITED" {
+				// Use server-provided backoff, or default to 10s if not specified
+				waitSec := msg.RetryAfter
+				if waitSec <= 0 {
+					waitSec = 10
+				}
+				until := time.Now().Add(time.Duration(waitSec) * time.Second)
+				c.retryUntil.Store(until.UnixMilli())
+				log.Printf("[ws] rate limited, pausing sends for %ds (until %s)", waitSec, until.Format("15:04:05"))
+			} else if msg.RetryAfter > 0 {
 				until := time.Now().Add(time.Duration(msg.RetryAfter) * time.Second)
 				c.retryUntil.Store(until.UnixMilli())
 				log.Printf("[ws] pausing sends for %ds (until %s)", msg.RetryAfter, until.Format("15:04:05"))
