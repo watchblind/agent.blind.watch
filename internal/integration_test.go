@@ -89,10 +89,9 @@ func (ms *miniServer) handler(w http.ResponseWriter, r *http.Request) {
 			var m protocol.WALSyncMessage
 			if json.Unmarshal(msg, &m) == nil {
 				ms.walSyncs = append(ms.walSyncs, m)
-				for _, entry := range m.Entries {
-					ack, _ := json.Marshal(protocol.AckMessage{Type: "ack", BatchID: entry.BatchID})
-					conn.WriteMessage(websocket.TextMessage, ack)
-				}
+				// ONE ack per WAL batch
+				ack, _ := json.Marshal(protocol.AckMessage{Type: "ack", BatchID: m.BatchID})
+				conn.WriteMessage(websocket.TextMessage, ack)
 			}
 		case "alert":
 			var m protocol.AlertMessage
@@ -341,21 +340,27 @@ func TestE2EWALRecovery(t *testing.T) {
 	go conn.Run(ctx)
 	go sched.Run(ctx)
 
-	// Wait for WAL sync to arrive at server
-	deadline := time.After(4 * time.Second)
+	// Wait for WAL sync to arrive at server.
+	// Each WAL entry is sent as a separate wal_sync message with 1s delay between.
+	deadline := time.After(10 * time.Second)
 	for {
 		select {
 		case <-deadline:
-			t.Fatal("timeout waiting for WAL sync")
-		case <-time.After(200 * time.Millisecond):
 			syncs := ms.getWALSyncs()
-			if len(syncs) == 0 {
-				continue
-			}
-
 			totalEntries := 0
 			for _, sync := range syncs {
 				totalEntries += len(sync.Entries)
+			}
+			t.Fatalf("timeout waiting for WAL sync (got %d messages, %d entries)", len(syncs), totalEntries)
+		case <-time.After(200 * time.Millisecond):
+			syncs := ms.getWALSyncs()
+			totalEntries := 0
+			for _, sync := range syncs {
+				totalEntries += len(sync.Entries)
+			}
+
+			if totalEntries < 3 {
+				continue // Wait for all 3 entries to arrive
 			}
 
 			if totalEntries != 3 {
@@ -426,26 +431,36 @@ func TestE2EGracefulShutdown(t *testing.T) {
 		// In idle mode with 10min batch interval, there should be buffered data → flush
 		t.Log("no flush received (may have no buffered data if collect ticker didn't fire)")
 	} else {
-		// Verify flush is encrypted and valid
+		// Verify flush has entries and is encrypted
 		for _, f := range flushes {
-			if f.EncPayload == "" {
-				t.Error("flush has empty enc_payload")
+			if len(f.Entries) == 0 {
+				t.Error("flush has no entries")
 			}
 			if !strings.HasPrefix(f.BatchID, "flush_") {
 				t.Errorf("flush batch_id should start with flush_, got %s", f.BatchID)
 			}
 
-			// Verify we can decrypt it
-			decrypted, err := enc.Decrypt(f.EncPayload)
-			if err != nil {
-				t.Errorf("failed to decrypt flush: %v", err)
-				continue
-			}
+			// Verify each entry can be decrypted
+			for i, entry := range f.Entries {
+				if entry.EncPayload == "" {
+					t.Errorf("flush entry %d has empty enc_payload", i)
+					continue
+				}
 
-			// Should contain array of snapshots
-			var snapshots []json.RawMessage
-			if err := json.Unmarshal(decrypted, &snapshots); err != nil {
-				t.Errorf("flush payload is not an array: %v", err)
+				decrypted, err := enc.Decrypt(entry.EncPayload)
+				if err != nil {
+					t.Errorf("failed to decrypt flush entry %d: %v", i, err)
+					continue
+				}
+
+				// Should be valid JSON with metrics
+				var snap struct {
+					Timestamp int64              `json:"timestamp"`
+					Metrics   []collector.Metric `json:"metrics"`
+				}
+				if err := json.Unmarshal(decrypted, &snap); err != nil {
+					t.Errorf("flush entry %d is not valid JSON: %v", i, err)
+				}
 			}
 		}
 	}

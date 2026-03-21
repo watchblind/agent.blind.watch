@@ -38,10 +38,23 @@ type MetricPayload struct {
 	Metrics   []collector.Metric `json:"metrics"`
 }
 
+const (
+	idleCollectInterval = 10 * time.Second
+	liveCollectInterval = 1 * time.Second
+	batchInterval       = 10 * time.Minute
+	retentionDuration   = 90 * time.Second
+)
 
 // Scheduler orchestrates metric collection, batching, encryption, and sending.
-// In idle mode: collects every collectInterval, batches and sends every batchInterval (clock-aligned).
-// In live mode: collects and sends every collectInterval (1s).
+//
+// Two independent data paths:
+//
+// Idle path (always running): collects every 10s, buffers locally, sends ONE
+// "batch" message with all entries on 10-minute wall-clock boundaries. On ack
+// the WAL entry is deleted and entries move to a 90-second retention buffer.
+//
+// Live path (only when viewer connected): sends "live" message each second.
+// Uses single-ticker optimization — every 10th tick also appends to batch buffer.
 type Scheduler struct {
 	agentID   string
 	epoch     int
@@ -50,17 +63,25 @@ type Scheduler struct {
 	conn      *transport.Connection
 	wal       *wal.WAL
 
-	mu              sync.RWMutex
-	mode            Mode
-	collectInterval time.Duration
-	batchInterval   time.Duration
+	mu   sync.RWMutex
+	mode Mode
 
-	// Buffer for accumulating snapshots between batch sends (idle mode).
+	// Buffer for accumulating snapshots between batch sends (idle path).
 	batchMu  sync.Mutex
 	batchBuf []Snapshot
 
+	// Retention: last sent batch kept for 90s to cover AE ingestion lag.
+	// Used for replay message on live mode activation.
+	retentionMu    sync.Mutex
+	retentionBuf   []Snapshot
+	retentionEpoch int
+	retentionTimer *time.Timer
+
 	// Channel to signal pace changes to the run loop.
 	paceChanged chan struct{}
+
+	// Live tick counter for single-collector optimization.
+	liveTickCount int
 }
 
 func New(
@@ -72,37 +93,29 @@ func New(
 	w *wal.WAL,
 ) *Scheduler {
 	return &Scheduler{
-		agentID:         agentID,
-		epoch:           epoch,
-		encryptor:       enc,
-		orch:            orch,
-		conn:            conn,
-		wal:             w,
-		mode:            ModeIdle,
-		collectInterval: 10 * time.Second,
-		batchInterval:   10 * time.Minute,
-		paceChanged:     make(chan struct{}, 1),
+		agentID:     agentID,
+		epoch:       epoch,
+		encryptor:   enc,
+		orch:        orch,
+		conn:        conn,
+		wal:         w,
+		mode:        ModeIdle,
+		paceChanged: make(chan struct{}, 1),
 	}
 }
 
-// SetPace updates collection and send intervals. Called when server sends a pace message.
+// SetPace updates the operating mode. Called when server sends a pace message.
+// intervalMS=0 means idle mode; non-zero means live mode.
 func (s *Scheduler) SetPace(intervalMS, collectMS int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if collectMS > 0 {
-		s.collectInterval = time.Duration(collectMS) * time.Millisecond
-	}
-
 	if intervalMS == 0 {
-		// Return to batch mode
 		s.mode = ModeIdle
-		s.collectInterval = 10 * time.Second
-		log.Printf("[scheduler] switching to idle mode (collect=%v, batch=%v)", s.collectInterval, s.batchInterval)
+		log.Printf("[scheduler] switching to idle mode (collect=10s, batch=10m)")
 	} else {
 		s.mode = ModeLive
-		s.collectInterval = time.Duration(collectMS) * time.Millisecond
-		log.Printf("[scheduler] switching to live mode (collect=%v)", s.collectInterval)
+		log.Printf("[scheduler] switching to live mode (collect=1s)")
 	}
 
 	// Signal run loop to reset ticker
@@ -130,7 +143,7 @@ func (s *Scheduler) EncryptorAndEpoch() (*crypto.Encryptor, int) {
 	return s.encryptor, s.epoch
 }
 
-// Mode returns the current operating mode.
+// GetMode returns the current operating mode.
 func (s *Scheduler) GetMode() Mode {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -146,6 +159,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 	s.runLoop(ctx)
 }
 
+// syncWAL resends pending WAL batches on startup. Each WAL file is a full
+// batch (entries array) that can be resent as a single wal_sync message.
 func (s *Scheduler) syncWAL() {
 	entries, err := s.wal.Pending()
 	if err != nil {
@@ -159,44 +174,62 @@ func (s *Scheduler) syncWAL() {
 
 	log.Printf("[scheduler] syncing %d WAL entries", len(entries))
 
-	// Send WAL entries one per message to avoid AE dropping writes.
-	// Each message triggers exactly 1 writeDataPoint in the DO.
 	for i, e := range entries {
-		if err := s.conn.Send(protocol.WALSyncMessage{
-			Type: "wal_sync",
-			Entries: []protocol.WALSyncEntry{{
-				BatchID:    e.BatchID,
+		// Each WAL entry is a full batch stored as JSON array of BatchEntry.
+		// Deserialize the entries to resend in proper format.
+		var batchEntries []protocol.BatchEntry
+		if plainEntries, err := deserializeWALEntries(e.EncPayload); err == nil {
+			batchEntries = plainEntries
+		} else {
+			// Legacy format: single encrypted payload per WAL entry.
+			// Wrap it as a single-entry batch for backward compatibility.
+			batchEntries = []protocol.BatchEntry{{
 				Epoch:      e.Epoch,
 				Timestamp:  e.Timestamp,
 				EncPayload: e.EncPayload,
-			}},
+			}}
+		}
+
+		if err := s.conn.Send(protocol.WALSyncMessage{
+			Type:    "wal_sync",
+			BatchID: e.BatchID,
+			Entries: batchEntries,
 		}); err != nil {
 			log.Printf("[scheduler] WAL sync entry %d send failed: %v", i, err)
 		}
 
-		// 1 write per second to stay safely under AE rate limits
+		// Space out sends to avoid overwhelming the server
 		if i < len(entries)-1 {
 			time.Sleep(time.Second)
 		}
 	}
 }
 
-func (s *Scheduler) runLoop(ctx context.Context) {
-	s.mu.RLock()
-	interval := s.collectInterval
-	s.mu.RUnlock()
+// deserializeWALEntries tries to parse a WAL payload as a JSON array of BatchEntry.
+// Returns error if it's not in the new batch format (legacy single-entry WAL).
+func deserializeWALEntries(payload string) ([]protocol.BatchEntry, error) {
+	var entries []protocol.BatchEntry
+	if err := json.Unmarshal([]byte(payload), &entries); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("empty entries array")
+	}
+	return entries, nil
+}
 
-	collectTicker := time.NewTicker(interval)
+func (s *Scheduler) runLoop(ctx context.Context) {
+	// Start with idle interval; adjusted on pace change.
+	collectTicker := time.NewTicker(idleCollectInterval)
 	defer collectTicker.Stop()
 
-	// Clock-aligned batch timer
+	// Clock-aligned batch timer (idle path).
 	batchTimer := time.NewTimer(s.timeUntilNextBatch())
 	defer batchTimer.Stop()
 
 	for {
 		s.mu.RLock()
 		mode := s.mode
-		currentInterval := s.collectInterval
 		s.mu.RUnlock()
 
 		select {
@@ -206,22 +239,27 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 			return
 
 		case <-s.paceChanged:
-			// Pace changed — reset collect ticker and flush buffered data
 			s.mu.RLock()
-			newInterval := s.collectInterval
 			newMode := s.mode
 			s.mu.RUnlock()
-			collectTicker.Reset(newInterval)
 
-			// When switching to live mode:
-			// 1. Send all buffered idle-mode snapshots as individual live messages
-			// 2. Immediately collect+send a fresh snapshot so the dashboard
-			//    gets data without waiting for the next ticker (up to 10s delay)
 			if newMode == ModeLive {
-				s.flushBufferAsLive()
+				// Switch to 1s ticker for live mode
+				collectTicker.Reset(liveCollectInterval)
+				s.liveTickCount = 0
+
+				// Send replay message with retained + buffered data
+				s.sendReplay()
+
+				// Immediately collect+send a fresh snapshot
 				if snap := s.collect(ctx); snap != nil {
 					s.sendLive(snap)
+					s.liveTickCount++
 				}
+			} else {
+				// Switch back to 10s ticker for idle mode
+				collectTicker.Reset(idleCollectInterval)
+				s.liveTickCount = 0
 			}
 
 		case <-collectTicker.C:
@@ -231,30 +269,23 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 			}
 
 			if mode == ModeLive {
-				// Live mode: stream to dashboard, buffer for batch AE persistence
+				// Live path: stream to dashboard every second
 				s.sendLive(snap)
-				s.bufferSnapshot(snap)
-			} else {
-				// Idle mode: send immediately to AE (1 write per collect interval)
-				// No buffering — each snapshot is its own WS message = 1 writeDataPoint
-				// per DO invocation, avoiding AE silent write drops.
-				s.sendBatchSingle(snap)
-			}
+				s.liveTickCount++
 
-			// Reset ticker if interval changed
-			s.mu.RLock()
-			newInterval := s.collectInterval
-			s.mu.RUnlock()
-			if newInterval != currentInterval {
-				collectTicker.Reset(newInterval)
+				// Single-collector optimization: every 10th tick, also
+				// append to the batch buffer for AE persistence.
+				if s.liveTickCount%10 == 0 {
+					s.bufferSnapshot(snap)
+				}
+			} else {
+				// Idle path: collect every 10s, buffer locally
+				s.bufferSnapshot(snap)
 			}
 
 		case <-batchTimer.C:
-			if mode == ModeLive {
-				// Run batch send in goroutine so live streaming continues unblocked.
-				// sendBatch drains batchBuf under lock before the goroutine starts sleeping.
-				go s.sendBatch()
-			}
+			// 10-minute wall-clock boundary: send batch (idle path, always runs).
+			s.sendBatch()
 			batchTimer.Reset(s.timeUntilNextBatch())
 		}
 	}
@@ -279,6 +310,8 @@ func (s *Scheduler) bufferSnapshot(snap *Snapshot) {
 	s.batchBuf = append(s.batchBuf, *snap)
 }
 
+// sendBatch encrypts all buffered snapshots individually, writes to WAL as
+// one entry, and sends ONE "batch" message with all entries.
 func (s *Scheduler) sendBatch() {
 	s.batchMu.Lock()
 	snapshots := s.batchBuf
@@ -294,35 +327,50 @@ func (s *Scheduler) sendBatch() {
 	epoch := s.epoch
 	s.mu.RUnlock()
 
-	now := time.Now()
-	baseBatchID := fmt.Sprintf("b_%d_%s", now.Unix(), s.agentID)
+	batchID := fmt.Sprintf("b_%d_%s", time.Now().Unix(), s.agentID)
 
-	// Downsample to 10-second resolution for AE persistence.
-	// In live mode (1s collection), 10 minutes = 600 snapshots, but AE rate limit
-	// is ~6 writes/min. Sending every 10th snapshot yields ~60 writes at safe rate.
-	// The dashboard already has full 1s resolution from live WS messages.
-	var downsampled []Snapshot
-	if len(snapshots) > 60 {
-		// Live mode: take every Nth snapshot to get ~60 entries
-		step := len(snapshots) / 60
-		if step < 1 {
-			step = 1
-		}
-		for i := 0; i < len(snapshots); i += step {
-			downsampled = append(downsampled, snapshots[i])
-		}
-		// Always include the last snapshot
-		if downsampled[len(downsampled)-1].Timestamp != snapshots[len(snapshots)-1].Timestamp {
-			downsampled = append(downsampled, snapshots[len(snapshots)-1])
-		}
-	} else {
-		downsampled = snapshots
+	entries := s.encryptSnapshots(snapshots, enc, epoch)
+	if len(entries) == 0 {
+		return
 	}
 
-	var sentCount int
-	var totalBytes int
+	// Serialize entries for WAL storage
+	walPayload, err := json.Marshal(entries)
+	if err != nil {
+		log.Printf("[scheduler] marshal WAL entries error: %v", err)
+		return
+	}
 
-	for i, snap := range downsampled {
+	// WAL: persist full batch before sending
+	if err := s.wal.Append(wal.Entry{
+		BatchID:    batchID,
+		AgentID:    s.agentID,
+		Epoch:      epoch,
+		Timestamp:  snapshots[0].Timestamp,
+		EncPayload: string(walPayload),
+	}); err != nil {
+		log.Printf("[scheduler] WAL append error: %v", err)
+	}
+
+	if err := s.conn.Send(protocol.BatchMessage{
+		Type:    "batch",
+		BatchID: batchID,
+		Epoch:   epoch,
+		Entries: entries,
+	}); err != nil {
+		log.Printf("[scheduler] batch send error: %v (data in WAL)", err)
+	} else {
+		log.Printf("[scheduler] batch sent: %s (%d entries)", batchID, len(entries))
+	}
+
+	// Move snapshots to retention buffer (kept for 90s for replay)
+	s.setRetention(snapshots, epoch)
+}
+
+// encryptSnapshots encrypts each snapshot's MetricPayload individually.
+func (s *Scheduler) encryptSnapshots(snapshots []Snapshot, enc *crypto.Encryptor, epoch int) []protocol.BatchEntry {
+	var entries []protocol.BatchEntry
+	for _, snap := range snapshots {
 		payload := MetricPayload{
 			Timestamp: snap.Timestamp,
 			Metrics:   snap.Metrics,
@@ -337,94 +385,80 @@ func (s *Scheduler) sendBatch() {
 			log.Printf("[scheduler] encrypt snapshot error: %v", err)
 			continue
 		}
-
-		batchID := fmt.Sprintf("%s_%d", baseBatchID, i)
-
-		// WAL: persist before sending
-		if err := s.wal.Append(wal.Entry{
-			BatchID:    batchID,
-			AgentID:    s.agentID,
+		entries = append(entries, protocol.BatchEntry{
 			Epoch:      epoch,
 			Timestamp:  snap.Timestamp,
 			EncPayload: encrypted,
-		}); err != nil {
-			log.Printf("[scheduler] WAL append error: %v", err)
-		}
-
-		if err := s.conn.Send(protocol.BatchMessage{
-			Type:       "batch",
-			BatchID:    batchID,
-			Epoch:      epoch,
-			Timestamp:  snap.Timestamp,
-			EncPayload: encrypted,
-		}); err != nil {
-			log.Printf("[scheduler] batch entry %d send error: %v (data in WAL)", i, err)
-		} else {
-			sentCount++
-			totalBytes += len(encrypted)
-		}
-
-		// ~10 second delay between sends to stay under AE's ~6/min write rate limit
-		if i < len(downsampled)-1 {
-			time.Sleep(10 * time.Second)
-		}
+		})
 	}
-
-	if sentCount > 0 {
-		log.Printf("[scheduler] batch sent: %s (%d/%d snapshots, %d bytes, from %d buffered)",
-			baseBatchID, sentCount, len(downsampled), totalBytes, len(snapshots))
-	}
+	return entries
 }
 
-// sendBatchSingle encrypts and sends a single snapshot for AE persistence.
-// Used in idle mode where snapshots are sent immediately on collect.
-// Each message triggers exactly 1 writeDataPoint in the DO, avoiding AE write drops.
-//
-// Only metrics are persisted to AE (processes excluded) because:
-// - Combined payload (~19KB) exceeds AE's 16KB blob limit
-// - Metrics-only payload (~12KB) fits comfortably
-// - Process data is ephemeral and streamed live when viewers are connected
-func (s *Scheduler) sendBatchSingle(snap *Snapshot) {
+// setRetention stores the last sent batch for 90 seconds.
+// On live mode activation, this is replayed to the viewer.
+func (s *Scheduler) setRetention(snapshots []Snapshot, epoch int) {
+	s.retentionMu.Lock()
+	defer s.retentionMu.Unlock()
+
+	s.retentionBuf = snapshots
+	s.retentionEpoch = epoch
+
+	// Cancel previous timer if still running
+	if s.retentionTimer != nil {
+		s.retentionTimer.Stop()
+	}
+
+	s.retentionTimer = time.AfterFunc(retentionDuration, func() {
+		s.retentionMu.Lock()
+		defer s.retentionMu.Unlock()
+		s.retentionBuf = nil
+		s.retentionEpoch = 0
+		log.Printf("[scheduler] retention buffer purged (90s expired)")
+	})
+}
+
+// sendReplay sends a "replay" message on live mode activation containing
+// the retained last batch (if within 90s) plus the current in-progress batch buffer.
+func (s *Scheduler) sendReplay() {
 	s.mu.RLock()
 	enc := s.encryptor
 	epoch := s.epoch
 	s.mu.RUnlock()
 
-	batchID := fmt.Sprintf("b_%d_%s", snap.Timestamp, s.agentID)
+	// Gather retained snapshots
+	s.retentionMu.Lock()
+	retained := s.retentionBuf
+	s.retentionMu.Unlock()
 
-	// Encrypt metrics-only payload to stay under AE's 16KB blob limit
-	payload := MetricPayload{
-		Timestamp: snap.Timestamp,
-		Metrics:   snap.Metrics,
-	}
-	plaintext, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("[scheduler] marshal snapshot error: %v", err)
+	// Gather current batch buffer (don't drain — idle path still owns it)
+	s.batchMu.Lock()
+	buffered := make([]Snapshot, len(s.batchBuf))
+	copy(buffered, s.batchBuf)
+	s.batchMu.Unlock()
+
+	// Combine: retained first, then buffered
+	var combined []Snapshot
+	combined = append(combined, retained...)
+	combined = append(combined, buffered...)
+
+	if len(combined) == 0 {
 		return
 	}
-	encrypted, err := enc.Encrypt(plaintext)
-	if err != nil {
-		log.Printf("[scheduler] encrypt snapshot error: %v", err)
+
+	entries := s.encryptSnapshots(combined, enc, epoch)
+	if len(entries) == 0 {
 		return
 	}
 
-	// WAL: persist before sending
-	s.wal.Append(wal.Entry{
-		BatchID:    batchID,
-		AgentID:    s.agentID,
-		Epoch:      epoch,
-		Timestamp:  snap.Timestamp,
-		EncPayload: encrypted,
-	})
-
-	if err := s.conn.Send(protocol.BatchMessage{
-		Type:       "batch",
-		BatchID:    batchID,
-		Epoch:      epoch,
-		Timestamp:  snap.Timestamp,
-		EncPayload: encrypted,
+	if err := s.conn.Send(protocol.ReplayMessage{
+		Type:    "replay",
+		Epoch:   epoch,
+		Entries: entries,
 	}); err != nil {
-		log.Printf("[scheduler] batch single send error: %v (data in WAL)", err)
+		log.Printf("[scheduler] replay send error: %v", err)
+	} else {
+		log.Printf("[scheduler] replay sent (%d entries: %d retained + %d buffered)",
+			len(entries), len(retained), len(buffered))
 	}
 }
 
@@ -452,28 +486,9 @@ func (s *Scheduler) sendLive(snap *Snapshot) {
 	})
 }
 
-// flushBufferAsLive sends buffered snapshots as live messages to the dashboard
-// without draining the buffer. The buffer is kept intact so batch sends still
-// persist all data to AE.
-func (s *Scheduler) flushBufferAsLive() {
-	s.batchMu.Lock()
-	snapshots := make([]Snapshot, len(s.batchBuf))
-	copy(snapshots, s.batchBuf)
-	s.batchMu.Unlock()
-
-	if len(snapshots) == 0 {
-		return
-	}
-
-	log.Printf("[scheduler] flushing %d buffered snapshots as live", len(snapshots))
-	for i := range snapshots {
-		s.sendLive(&snapshots[i])
-	}
-}
-
 // flush encrypts and sends any buffered data. Called on graceful shutdown.
 // Uses SendSync for each message since the process is shutting down.
-// Downsamples to ~60 entries if buffer is large (live mode).
+// Sends ONE message with all entries (same format as batch).
 func (s *Scheduler) flush() {
 	s.batchMu.Lock()
 	snapshots := s.batchBuf
@@ -489,78 +504,51 @@ func (s *Scheduler) flush() {
 	epoch := s.epoch
 	s.mu.RUnlock()
 
-	// Downsample if buffer is large (live mode with 1s collection)
-	toFlush := snapshots
-	if len(snapshots) > 60 {
-		step := len(snapshots) / 60
-		toFlush = nil
-		for i := 0; i < len(snapshots); i += step {
-			toFlush = append(toFlush, snapshots[i])
-		}
-		if toFlush[len(toFlush)-1].Timestamp != snapshots[len(snapshots)-1].Timestamp {
-			toFlush = append(toFlush, snapshots[len(snapshots)-1])
-		}
+	batchID := fmt.Sprintf("flush_%d_%s", time.Now().Unix(), s.agentID)
+
+	entries := s.encryptSnapshots(snapshots, enc, epoch)
+	if len(entries) == 0 {
+		return
 	}
 
-	now := time.Now()
-	baseBatchID := fmt.Sprintf("flush_%d_%s", now.Unix(), s.agentID)
-	var sentCount int
-
-	for i, snap := range toFlush {
-		payload := MetricPayload{
-			Timestamp: snap.Timestamp,
-			Metrics:   snap.Metrics,
-		}
-		plaintext, err := json.Marshal(payload)
-		if err != nil {
-			continue
-		}
-		encrypted, err := enc.Encrypt(plaintext)
-		if err != nil {
-			continue
-		}
-
-		batchID := fmt.Sprintf("%s_%d", baseBatchID, i)
-
-		// WAL: persist before sending
-		s.wal.Append(wal.Entry{
-			BatchID:    batchID,
-			AgentID:    s.agentID,
-			Epoch:      epoch,
-			Timestamp:  snap.Timestamp,
-			EncPayload: encrypted,
-		})
-
-		if err := s.conn.SendSync(protocol.FlushMessage{
-			Type:       "flush",
-			BatchID:    batchID,
-			Epoch:      epoch,
-			Timestamp:  snap.Timestamp,
-			EncPayload: encrypted,
-		}); err != nil {
-			log.Printf("[scheduler] flush entry %d send error: %v (data in WAL)", i, err)
-		} else {
-			sentCount++
-		}
+	// Serialize entries for WAL storage
+	walPayload, err := json.Marshal(entries)
+	if err != nil {
+		log.Printf("[scheduler] marshal WAL entries error: %v", err)
+		return
 	}
 
-	if sentCount > 0 {
-		log.Printf("[scheduler] flush sent: %s (%d/%d snapshots, from %d buffered)",
-			baseBatchID, sentCount, len(toFlush), len(snapshots))
+	// WAL: persist before sending
+	if err := s.wal.Append(wal.Entry{
+		BatchID:    batchID,
+		AgentID:    s.agentID,
+		Epoch:      epoch,
+		Timestamp:  snapshots[0].Timestamp,
+		EncPayload: string(walPayload),
+	}); err != nil {
+		log.Printf("[scheduler] WAL flush append error: %v", err)
+	}
+
+	if err := s.conn.SendSync(protocol.FlushMessage{
+		Type:    "flush",
+		BatchID: batchID,
+		Epoch:   epoch,
+		Entries: entries,
+	}); err != nil {
+		log.Printf("[scheduler] flush send error: %v (data in WAL)", err)
+	} else {
+		log.Printf("[scheduler] flush sent: %s (%d entries from %d buffered)",
+			batchID, len(entries), len(snapshots))
 	}
 }
 
-// timeUntilNextBatch returns the duration until the next clock-aligned batch window.
+// timeUntilNextBatch returns the duration until the next clock-aligned 10-minute boundary.
 func (s *Scheduler) timeUntilNextBatch() time.Duration {
-	s.mu.RLock()
-	interval := s.batchInterval
-	s.mu.RUnlock()
-
 	now := time.Now()
-	next := now.Truncate(interval).Add(interval)
+	next := now.Truncate(batchInterval).Add(batchInterval)
 	d := next.Sub(now)
 	if d <= 0 {
-		d = interval
+		d = batchInterval
 	}
 	return d
 }

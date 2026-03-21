@@ -195,27 +195,31 @@ func (s *Server) handleBatch(conn *websocket.Conn, meta AgentMeta, msg protocol.
 	// This prevents agent_id spoofing — the server tags it.
 	agentID := meta.AgentID
 
-	// Store the encrypted blob — we CANNOT read the content (E2E)
+	// Store each entry individually — each becomes one AE writeDataPoint
 	s.mu.Lock()
-	s.batches = append(s.batches, StoredBatch{
-		AgentID:    agentID,
-		BatchID:    msg.BatchID,
-		Epoch:      msg.Epoch,
-		Timestamp:  msg.Timestamp,
-		EncPayload: msg.EncPayload,
-		ReceivedAt: time.Now().Unix(),
-		Type:       "batch",
-	})
+	for _, entry := range msg.Entries {
+		s.batches = append(s.batches, StoredBatch{
+			AgentID:    agentID,
+			BatchID:    msg.BatchID,
+			Epoch:      entry.Epoch,
+			Timestamp:  entry.Timestamp,
+			EncPayload: entry.EncPayload,
+			ReceivedAt: time.Now().Unix(),
+			Type:       "batch",
+		})
+	}
 	batchCount := len(s.batches)
 	s.mu.Unlock()
 
-	log.Printf("[mockapi] stored batch %s (epoch=%d, payload=%d bytes, total_batches=%d)",
-		msg.BatchID, msg.Epoch, len(msg.EncPayload), batchCount)
+	log.Printf("[mockapi] stored batch %s (epoch=%d, %d entries, total_stored=%d)",
+		msg.BatchID, msg.Epoch, len(msg.Entries), batchCount)
 
-	// Broadcast to viewers if any (encrypted — viewers decrypt client-side)
-	s.broadcastToViewers(agentID, msg.Epoch, msg.Timestamp, msg.EncPayload)
+	// Broadcast each entry to viewers (encrypted — viewers decrypt client-side)
+	for _, entry := range msg.Entries {
+		s.broadcastToViewers(agentID, entry.Epoch, entry.Timestamp, entry.EncPayload)
+	}
 
-	// Ack — agent will delete from WAL
+	// Ack — ONE ack for the whole batch, agent deletes from WAL
 	sendJSON(conn, protocol.AckMessage{
 		Type:    "ack",
 		BatchID: msg.BatchID,
@@ -242,18 +246,20 @@ func (s *Server) handleLive(meta AgentMeta, msg protocol.LiveMessage) {
 
 func (s *Server) handleFlush(conn *websocket.Conn, meta AgentMeta, msg protocol.FlushMessage) {
 	s.mu.Lock()
-	s.batches = append(s.batches, StoredBatch{
-		AgentID:    meta.AgentID,
-		BatchID:    msg.BatchID,
-		Epoch:      msg.Epoch,
-		Timestamp:  msg.Timestamp,
-		EncPayload: msg.EncPayload,
-		ReceivedAt: time.Now().Unix(),
-		Type:       "flush",
-	})
+	for _, entry := range msg.Entries {
+		s.batches = append(s.batches, StoredBatch{
+			AgentID:    meta.AgentID,
+			BatchID:    msg.BatchID,
+			Epoch:      entry.Epoch,
+			Timestamp:  entry.Timestamp,
+			EncPayload: entry.EncPayload,
+			ReceivedAt: time.Now().Unix(),
+			Type:       "flush",
+		})
+	}
 	s.mu.Unlock()
 
-	log.Printf("[mockapi] stored flush %s", msg.BatchID)
+	log.Printf("[mockapi] stored flush %s (%d entries)", msg.BatchID, len(msg.Entries))
 
 	sendJSON(conn, protocol.AckMessage{
 		Type:    "ack",
@@ -262,13 +268,13 @@ func (s *Server) handleFlush(conn *websocket.Conn, meta AgentMeta, msg protocol.
 }
 
 func (s *Server) handleWALSync(conn *websocket.Conn, meta AgentMeta, msg protocol.WALSyncMessage) {
-	log.Printf("[mockapi] WAL sync: %d entries from %s", len(msg.Entries), meta.AgentID)
+	log.Printf("[mockapi] WAL sync: batch %s with %d entries from %s", msg.BatchID, len(msg.Entries), meta.AgentID)
 
 	for _, entry := range msg.Entries {
 		s.mu.Lock()
 		s.batches = append(s.batches, StoredBatch{
 			AgentID:    meta.AgentID,
-			BatchID:    entry.BatchID,
+			BatchID:    msg.BatchID,
 			Epoch:      entry.Epoch,
 			Timestamp:  entry.Timestamp,
 			EncPayload: entry.EncPayload,
@@ -276,13 +282,13 @@ func (s *Server) handleWALSync(conn *websocket.Conn, meta AgentMeta, msg protoco
 			Type:       "wal_sync",
 		})
 		s.mu.Unlock()
-
-		// Ack each entry so agent cleans up its WAL
-		sendJSON(conn, protocol.AckMessage{
-			Type:    "ack",
-			BatchID: entry.BatchID,
-		})
 	}
+
+	// ONE ack for the whole WAL batch
+	sendJSON(conn, protocol.AckMessage{
+		Type:    "ack",
+		BatchID: msg.BatchID,
+	})
 }
 
 func (s *Server) handleAlert(meta AgentMeta, msg protocol.AlertMessage) {

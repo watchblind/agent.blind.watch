@@ -5,13 +5,13 @@ package protocol
 // The server knows the agent's identity from the authenticated WebSocket
 // connection (token → agent_id mapping). This prevents agent_id spoofing.
 
+// BatchMessage sends a 10-minute batch of individually-encrypted snapshots.
+// ONE message per batch window, ONE batch_id, ONE ack for the whole batch.
 type BatchMessage struct {
-	Type       string `json:"type"` // "batch"
-	BatchID    string `json:"batch_id"`
-	Epoch      int    `json:"epoch"`
-	Timestamp  int64  `json:"timestamp"`
-	EncPayload string `json:"enc_payload,omitempty"` // legacy single-blob (unused, kept for compat)
-	Entries    []BatchEntry `json:"entries,omitempty"`    // per-snapshot encrypted entries
+	Type    string       `json:"type"` // "batch"
+	BatchID string       `json:"batch_id"`
+	Epoch   int          `json:"epoch"`
+	Entries []BatchEntry `json:"entries"`
 }
 
 // BatchEntry is a single encrypted snapshot within a batch.
@@ -21,6 +21,15 @@ type BatchEntry struct {
 	EncPayload string `json:"enc_payload"`
 }
 
+// ReplayMessage is sent on live mode activation with retained last batch
+// (if within 90s) plus the current in-progress batch buffer.
+type ReplayMessage struct {
+	Type    string       `json:"type"` // "replay"
+	Epoch   int          `json:"epoch"`
+	Entries []BatchEntry `json:"entries"`
+}
+
+// LiveMessage sends a single encrypted snapshot (metrics + processes) each second.
 type LiveMessage struct {
 	Type       string `json:"type"` // "live"
 	Epoch      int    `json:"epoch"`
@@ -28,41 +37,21 @@ type LiveMessage struct {
 	EncPayload string `json:"enc_payload"`
 }
 
-type WALSyncMessage struct {
-	Type    string         `json:"type"` // "wal_sync"
-	Entries []WALSyncEntry `json:"entries"`
-}
-
-type WALSyncEntry struct {
-	BatchID    string `json:"batch_id"`
-	Epoch      int    `json:"epoch"`
-	Timestamp  int64  `json:"timestamp"`
-	EncPayload string `json:"enc_payload"`
-}
-
+// FlushMessage is sent on graceful shutdown with any buffered snapshots.
+// Same entries-array format as BatchMessage.
 type FlushMessage struct {
-	Type       string       `json:"type"` // "flush"
-	BatchID    string       `json:"batch_id"`
-	Epoch      int          `json:"epoch"`
-	Timestamp  int64        `json:"timestamp"`
-	EncPayload string       `json:"enc_payload,omitempty"` // legacy single-blob (unused)
-	Entries    []BatchEntry `json:"entries,omitempty"`      // per-snapshot encrypted entries
+	Type    string       `json:"type"` // "flush"
+	BatchID string       `json:"batch_id"`
+	Epoch   int          `json:"epoch"`
+	Entries []BatchEntry `json:"entries"`
 }
 
-type LiveProcMessage struct {
-	Type       string `json:"type"` // "live_proc"
-	Epoch      int    `json:"epoch"`
-	Timestamp  int64  `json:"timestamp"`
-	EncPayload string `json:"enc_payload"`
-}
-
-type BatchProcMessage struct {
-	Type       string `json:"type"` // "batch_proc"
-	BatchID    string `json:"batch_id"`
-	Epoch      int    `json:"epoch"`
-	Timestamp  int64  `json:"timestamp"`
-	EncPayload string `json:"enc_payload,omitempty"` // legacy single-blob (unused)
-	Entries    []BatchEntry `json:"entries,omitempty"`    // per-snapshot encrypted entries
+// WALSyncMessage re-sends a full batch from WAL on startup.
+// Each WAL file stores one complete batch that can be resent as-is.
+type WALSyncMessage struct {
+	Type    string       `json:"type"` // "wal_sync"
+	BatchID string       `json:"batch_id"`
+	Entries []BatchEntry `json:"entries"`
 }
 
 type AlertMessage struct {
