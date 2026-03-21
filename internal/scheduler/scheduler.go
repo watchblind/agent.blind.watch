@@ -30,17 +30,14 @@ type Snapshot struct {
 	Processes []collector.ProcessSnapshot `json:"processes,omitempty"`
 }
 
-// MetricPayload is the metrics-only portion sent as type "live" / "batch".
+// MetricPayload is the metrics-only portion for AE persistence.
+// Combined metrics+processes exceeds AE's 16KB blob limit (~19KB),
+// so only metrics (~12KB) are stored in AE.
 type MetricPayload struct {
 	Timestamp int64              `json:"timestamp"`
 	Metrics   []collector.Metric `json:"metrics"`
 }
 
-// ProcessPayload is the process-only portion sent as type "live_proc" / "batch_proc".
-type ProcessPayload struct {
-	Timestamp int64                      `json:"timestamp"`
-	Processes []collector.ProcessSnapshot `json:"processes"`
-}
 
 // Scheduler orchestrates metric collection, batching, encryption, and sending.
 // In idle mode: collects every collectInterval, batches and sends every batchInterval (clock-aligned).
@@ -162,23 +159,25 @@ func (s *Scheduler) syncWAL() {
 
 	log.Printf("[scheduler] syncing %d WAL entries", len(entries))
 
-	walEntries := make([]protocol.WALSyncEntry, 0, len(entries))
-	for _, e := range entries {
-		walEntries = append(walEntries, protocol.WALSyncEntry{
-			BatchID:    e.BatchID,
-			Epoch:      e.Epoch,
-			Timestamp:  e.Timestamp,
-			EncPayload: e.EncPayload,
-		})
-	}
+	// Send WAL entries one per message to avoid AE dropping writes.
+	// Each message triggers exactly 1 writeDataPoint in the DO.
+	for i, e := range entries {
+		if err := s.conn.Send(protocol.WALSyncMessage{
+			Type: "wal_sync",
+			Entries: []protocol.WALSyncEntry{{
+				BatchID:    e.BatchID,
+				Epoch:      e.Epoch,
+				Timestamp:  e.Timestamp,
+				EncPayload: e.EncPayload,
+			}},
+		}); err != nil {
+			log.Printf("[scheduler] WAL sync entry %d send failed: %v", i, err)
+		}
 
-	msg := protocol.WALSyncMessage{
-		Type:    "wal_sync",
-		Entries: walEntries,
-	}
-
-	if err := s.conn.Send(msg); err != nil {
-		log.Printf("[scheduler] WAL sync send failed: %v", err)
+		// 1 write per second to stay safely under AE rate limits
+		if i < len(entries)-1 {
+			time.Sleep(time.Second)
+		}
 	}
 }
 
@@ -231,11 +230,15 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 				continue
 			}
 
-			// Always buffer for batch persistence to AE
-			s.bufferSnapshot(snap)
-
 			if mode == ModeLive {
+				// Live mode: stream to dashboard, buffer for batch AE persistence
 				s.sendLive(snap)
+				s.bufferSnapshot(snap)
+			} else {
+				// Idle mode: send immediately to AE (1 write per collect interval)
+				// No buffering — each snapshot is its own WS message = 1 writeDataPoint
+				// per DO invocation, avoiding AE silent write drops.
+				s.sendBatchSingle(snap)
 			}
 
 			// Reset ticker if interval changed
@@ -247,7 +250,11 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 			}
 
 		case <-batchTimer.C:
-			s.sendBatch()
+			if mode == ModeLive {
+				// Run batch send in goroutine so live streaming continues unblocked.
+				// sendBatch drains batchBuf under lock before the goroutine starts sleeping.
+				go s.sendBatch()
+			}
 			batchTimer.Reset(s.timeUntilNextBatch())
 		}
 	}
@@ -288,13 +295,34 @@ func (s *Scheduler) sendBatch() {
 	s.mu.RUnlock()
 
 	now := time.Now()
+	baseBatchID := fmt.Sprintf("b_%d_%s", now.Unix(), s.agentID)
 
-	// --- Metrics batch (encrypt each snapshot individually to stay under AE 16KB blob limit) ---
-	metricBatchID := fmt.Sprintf("b_%d_%s", now.Unix(), s.agentID)
-	var metricEntries []protocol.BatchEntry
+	// Downsample to 10-second resolution for AE persistence.
+	// In live mode (1s collection), 10 minutes = 600 snapshots, but AE rate limit
+	// is ~6 writes/min. Sending every 10th snapshot yields ~60 writes at safe rate.
+	// The dashboard already has full 1s resolution from live WS messages.
+	var downsampled []Snapshot
+	if len(snapshots) > 60 {
+		// Live mode: take every Nth snapshot to get ~60 entries
+		step := len(snapshots) / 60
+		if step < 1 {
+			step = 1
+		}
+		for i := 0; i < len(snapshots); i += step {
+			downsampled = append(downsampled, snapshots[i])
+		}
+		// Always include the last snapshot
+		if downsampled[len(downsampled)-1].Timestamp != snapshots[len(snapshots)-1].Timestamp {
+			downsampled = append(downsampled, snapshots[len(snapshots)-1])
+		}
+	} else {
+		downsampled = snapshots
+	}
+
+	var sentCount int
 	var totalBytes int
 
-	for _, snap := range snapshots {
+	for i, snap := range downsampled {
 		payload := MetricPayload{
 			Timestamp: snap.Timestamp,
 			Metrics:   snap.Metrics,
@@ -309,71 +337,94 @@ func (s *Scheduler) sendBatch() {
 			log.Printf("[scheduler] encrypt snapshot error: %v", err)
 			continue
 		}
-		metricEntries = append(metricEntries, protocol.BatchEntry{
+
+		batchID := fmt.Sprintf("%s_%d", baseBatchID, i)
+
+		// WAL: persist before sending
+		if err := s.wal.Append(wal.Entry{
+			BatchID:    batchID,
+			AgentID:    s.agentID,
 			Epoch:      epoch,
 			Timestamp:  snap.Timestamp,
 			EncPayload: encrypted,
-		})
-		totalBytes += len(encrypted)
-	}
-
-	if len(metricEntries) > 0 {
-		// WAL: store each entry individually so wal_sync replays work
-		for i, entry := range metricEntries {
-			walEntry := wal.Entry{
-				BatchID:    fmt.Sprintf("%s_%d", metricBatchID, i),
-				AgentID:    s.agentID,
-				Epoch:      entry.Epoch,
-				Timestamp:  entry.Timestamp,
-				EncPayload: entry.EncPayload,
-			}
-			if err := s.wal.Append(walEntry); err != nil {
-				log.Printf("[scheduler] WAL append error: %v", err)
-			}
+		}); err != nil {
+			log.Printf("[scheduler] WAL append error: %v", err)
 		}
 
 		if err := s.conn.Send(protocol.BatchMessage{
-			Type:    "batch",
-			BatchID: metricBatchID,
-			Epoch:   epoch,
-			Entries: metricEntries,
+			Type:       "batch",
+			BatchID:    batchID,
+			Epoch:      epoch,
+			Timestamp:  snap.Timestamp,
+			EncPayload: encrypted,
 		}); err != nil {
-			log.Printf("[scheduler] metric batch send error: %v (data in WAL)", err)
+			log.Printf("[scheduler] batch entry %d send error: %v (data in WAL)", i, err)
 		} else {
-			log.Printf("[scheduler] metric batch sent: %s (%d snapshots, %d bytes)",
-				metricBatchID, len(metricEntries), totalBytes)
+			sentCount++
+			totalBytes += len(encrypted)
+		}
+
+		// ~10 second delay between sends to stay under AE's ~6/min write rate limit
+		if i < len(downsampled)-1 {
+			time.Sleep(10 * time.Second)
 		}
 	}
 
-	// --- Process batch (collect all process data) ---
-	var procPayloads []ProcessPayload
-	for _, snap := range snapshots {
-		if len(snap.Processes) > 0 {
-			procPayloads = append(procPayloads, ProcessPayload{
-				Timestamp: snap.Timestamp,
-				Processes: snap.Processes,
-			})
-		}
+	if sentCount > 0 {
+		log.Printf("[scheduler] batch sent: %s (%d/%d snapshots, %d bytes, from %d buffered)",
+			baseBatchID, sentCount, len(downsampled), totalBytes, len(snapshots))
+	}
+}
+
+// sendBatchSingle encrypts and sends a single snapshot for AE persistence.
+// Used in idle mode where snapshots are sent immediately on collect.
+// Each message triggers exactly 1 writeDataPoint in the DO, avoiding AE write drops.
+//
+// Only metrics are persisted to AE (processes excluded) because:
+// - Combined payload (~19KB) exceeds AE's 16KB blob limit
+// - Metrics-only payload (~12KB) fits comfortably
+// - Process data is ephemeral and streamed live when viewers are connected
+func (s *Scheduler) sendBatchSingle(snap *Snapshot) {
+	s.mu.RLock()
+	enc := s.encryptor
+	epoch := s.epoch
+	s.mu.RUnlock()
+
+	batchID := fmt.Sprintf("b_%d_%s", snap.Timestamp, s.agentID)
+
+	// Encrypt metrics-only payload to stay under AE's 16KB blob limit
+	payload := MetricPayload{
+		Timestamp: snap.Timestamp,
+		Metrics:   snap.Metrics,
+	}
+	plaintext, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[scheduler] marshal snapshot error: %v", err)
+		return
+	}
+	encrypted, err := enc.Encrypt(plaintext)
+	if err != nil {
+		log.Printf("[scheduler] encrypt snapshot error: %v", err)
+		return
 	}
 
-	if len(procPayloads) > 0 {
-		procBatchID := fmt.Sprintf("bp_%d_%s", now.Unix(), s.agentID)
-		if plaintext, err := json.Marshal(procPayloads); err == nil {
-			if encrypted, err := enc.Encrypt(plaintext); err == nil {
-				if err := s.conn.Send(protocol.BatchProcMessage{
-					Type:       "batch_proc",
-					BatchID:    procBatchID,
-					Epoch:      epoch,
-					Timestamp:  now.Unix(),
-					EncPayload: encrypted,
-				}); err != nil {
-					log.Printf("[scheduler] process batch send error: %v", err)
-				} else {
-					log.Printf("[scheduler] process batch sent: %s (%d snapshots, %d bytes)",
-						procBatchID, len(procPayloads), len(encrypted))
-				}
-			}
-		}
+	// WAL: persist before sending
+	s.wal.Append(wal.Entry{
+		BatchID:    batchID,
+		AgentID:    s.agentID,
+		Epoch:      epoch,
+		Timestamp:  snap.Timestamp,
+		EncPayload: encrypted,
+	})
+
+	if err := s.conn.Send(protocol.BatchMessage{
+		Type:       "batch",
+		BatchID:    batchID,
+		Epoch:      epoch,
+		Timestamp:  snap.Timestamp,
+		EncPayload: encrypted,
+	}); err != nil {
+		log.Printf("[scheduler] batch single send error: %v (data in WAL)", err)
 	}
 }
 
@@ -383,39 +434,22 @@ func (s *Scheduler) sendLive(snap *Snapshot) {
 	epoch := s.epoch
 	s.mu.RUnlock()
 
-	// Send metrics payload
-	metricPayload := MetricPayload{
-		Timestamp: snap.Timestamp,
-		Metrics:   snap.Metrics,
+	// Send combined metrics+processes as single "live" message.
+	// Frontend handleMetricMessage extracts both from the DecryptedSnapshot.
+	plaintext, err := json.Marshal(snap)
+	if err != nil {
+		return
 	}
-	if plaintext, err := json.Marshal(metricPayload); err == nil {
-		if encrypted, err := enc.Encrypt(plaintext); err == nil {
-			s.conn.Send(protocol.LiveMessage{
-				Type:       "live",
-				Epoch:      epoch,
-				Timestamp:  snap.Timestamp,
-				EncPayload: encrypted,
-			})
-		}
+	encrypted, err := enc.Encrypt(plaintext)
+	if err != nil {
+		return
 	}
-
-	// Send process payload separately (if present)
-	if len(snap.Processes) > 0 {
-		procPayload := ProcessPayload{
-			Timestamp: snap.Timestamp,
-			Processes: snap.Processes,
-		}
-		if plaintext, err := json.Marshal(procPayload); err == nil {
-			if encrypted, err := enc.Encrypt(plaintext); err == nil {
-				s.conn.Send(protocol.LiveProcMessage{
-					Type:       "live_proc",
-					Epoch:      epoch,
-					Timestamp:  snap.Timestamp,
-					EncPayload: encrypted,
-				})
-			}
-		}
-	}
+	s.conn.Send(protocol.LiveMessage{
+		Type:       "live",
+		Epoch:      epoch,
+		Timestamp:  snap.Timestamp,
+		EncPayload: encrypted,
+	})
 }
 
 // flushBufferAsLive sends buffered snapshots as live messages to the dashboard
@@ -438,6 +472,8 @@ func (s *Scheduler) flushBufferAsLive() {
 }
 
 // flush encrypts and sends any buffered data. Called on graceful shutdown.
+// Uses SendSync for each message since the process is shutting down.
+// Downsamples to ~60 entries if buffer is large (live mode).
 func (s *Scheduler) flush() {
 	s.batchMu.Lock()
 	snapshots := s.batchBuf
@@ -453,98 +489,64 @@ func (s *Scheduler) flush() {
 	epoch := s.epoch
 	s.mu.RUnlock()
 
+	// Downsample if buffer is large (live mode with 1s collection)
+	toFlush := snapshots
+	if len(snapshots) > 60 {
+		step := len(snapshots) / 60
+		toFlush = nil
+		for i := 0; i < len(snapshots); i += step {
+			toFlush = append(toFlush, snapshots[i])
+		}
+		if toFlush[len(toFlush)-1].Timestamp != snapshots[len(snapshots)-1].Timestamp {
+			toFlush = append(toFlush, snapshots[len(snapshots)-1])
+		}
+	}
+
 	now := time.Now()
+	baseBatchID := fmt.Sprintf("flush_%d_%s", now.Unix(), s.agentID)
+	var sentCount int
 
-	// --- Flush metrics (encrypt each snapshot individually to stay under AE 16KB blob limit) ---
-	metricBatchID := fmt.Sprintf("flush_%d_%s", now.Unix(), s.agentID)
-	var metricEntries []protocol.BatchEntry
-	var totalBytes int
-
-	for _, snap := range snapshots {
+	for i, snap := range toFlush {
 		payload := MetricPayload{
 			Timestamp: snap.Timestamp,
 			Metrics:   snap.Metrics,
 		}
 		plaintext, err := json.Marshal(payload)
 		if err != nil {
-			log.Printf("[scheduler] flush marshal snapshot error: %v", err)
 			continue
 		}
 		encrypted, err := enc.Encrypt(plaintext)
 		if err != nil {
-			log.Printf("[scheduler] flush encrypt snapshot error: %v", err)
 			continue
 		}
-		metricEntries = append(metricEntries, protocol.BatchEntry{
+
+		batchID := fmt.Sprintf("%s_%d", baseBatchID, i)
+
+		// WAL: persist before sending
+		s.wal.Append(wal.Entry{
+			BatchID:    batchID,
+			AgentID:    s.agentID,
 			Epoch:      epoch,
 			Timestamp:  snap.Timestamp,
 			EncPayload: encrypted,
 		})
-		totalBytes += len(encrypted)
-	}
-
-	if len(metricEntries) > 0 {
-		// WAL: store each entry individually
-		for i, entry := range metricEntries {
-			walEntry := wal.Entry{
-				BatchID:    fmt.Sprintf("%s_%d", metricBatchID, i),
-				AgentID:    s.agentID,
-				Epoch:      entry.Epoch,
-				Timestamp:  entry.Timestamp,
-				EncPayload: entry.EncPayload,
-			}
-			if err := s.wal.Append(walEntry); err != nil {
-				log.Printf("[scheduler] WAL append error: %v", err)
-			}
-		}
 
 		if err := s.conn.SendSync(protocol.FlushMessage{
-			Type:    "flush",
-			BatchID: metricBatchID,
-			Epoch:   epoch,
-			Entries: metricEntries,
-		}); err != nil {
-			log.Printf("[scheduler] flush send failed: %v (data in WAL)", err)
-		} else {
-			log.Printf("[scheduler] flush sent: %s (%d snapshots, %d bytes)",
-				metricBatchID, len(metricEntries), totalBytes)
-		}
-	}
-
-	// --- Flush processes (no WAL — process data is ephemeral) ---
-	procBatchID := fmt.Sprintf("flushp_%d_%s", now.Unix(), s.agentID)
-	var procEntries []protocol.BatchEntry
-
-	for _, snap := range snapshots {
-		if len(snap.Processes) == 0 {
-			continue
-		}
-		payload := ProcessPayload{
-			Timestamp: snap.Timestamp,
-			Processes: snap.Processes,
-		}
-		plaintext, err := json.Marshal(payload)
-		if err != nil {
-			continue
-		}
-		encrypted, err := enc.Encrypt(plaintext)
-		if err != nil {
-			continue
-		}
-		procEntries = append(procEntries, protocol.BatchEntry{
+			Type:       "flush",
+			BatchID:    batchID,
 			Epoch:      epoch,
 			Timestamp:  snap.Timestamp,
 			EncPayload: encrypted,
-		})
+		}); err != nil {
+			log.Printf("[scheduler] flush entry %d send error: %v (data in WAL)", i, err)
+		} else {
+			sentCount++
+		}
 	}
 
-	if len(procEntries) > 0 {
-		s.conn.SendSync(protocol.BatchProcMessage{
-			Type:    "batch_proc",
-			BatchID: procBatchID,
-			Epoch:   epoch,
-			Entries: procEntries,
-		})
+	if sentCount > 0 {
+		log.Printf("[scheduler] flush sent: %s (%d/%d snapshots, from %d buffered)",
+			baseBatchID, sentCount, len(toFlush), len(snapshots))
 	}
 }
 
