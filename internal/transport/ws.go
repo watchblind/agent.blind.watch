@@ -16,6 +16,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// sendItem wraps raw message bytes with a rate-limit category so the
+// write pump can skip messages whose category is currently throttled.
+type sendItem struct {
+	data     []byte
+	category string // "live", "batch", "wal", "other"
+}
+
 // Connection manages a persistent WebSocket connection to the server.
 // It handles reconnection with exponential backoff and message routing.
 type Connection struct {
@@ -29,11 +36,11 @@ type Connection struct {
 
 	connected atomic.Bool
 	stopCh    chan struct{}
-	sendCh    chan []byte
+	sendCh    chan sendItem
 
-	// retryUntil is a unix millisecond timestamp until which sends are paused.
-	// Set when server sends an error with retry_after.
-	retryUntil atomic.Int64
+	// Per-category retryUntil — unix millisecond timestamp until which
+	// sends of that category are paused. Keyed by category string.
+	categoryRetry sync.Map // map[string]*atomic.Int64
 
 	// Callbacks
 	onAck        func(batchID string)
@@ -44,6 +51,20 @@ type Connection struct {
 	onDEKRotated func(newEpoch int)
 }
 
+// msgCategory maps a message type to a rate-limit category.
+func msgCategory(msgType string) string {
+	switch msgType {
+	case "live", "live_proc":
+		return "live"
+	case "batch", "flush", "batch_proc":
+		return "batch"
+	case "wal_sync":
+		return "wal"
+	default:
+		return "other"
+	}
+}
+
 // NewConnection creates a new WebSocket connection manager.
 func NewConnection(url, token, agentID, version string) *Connection {
 	return &Connection{
@@ -52,8 +73,14 @@ func NewConnection(url, token, agentID, version string) *Connection {
 		agentID: agentID,
 		version: version,
 		stopCh:  make(chan struct{}),
-		sendCh:  make(chan []byte, 256),
+		sendCh:  make(chan sendItem, 256),
 	}
+}
+
+// getRetryUntil returns the atomic retry timestamp for a category.
+func (c *Connection) getRetryUntil(category string) *atomic.Int64 {
+	val, _ := c.categoryRetry.LoadOrStore(category, &atomic.Int64{})
+	return val.(*atomic.Int64)
 }
 
 // Callbacks
@@ -117,8 +144,9 @@ func (c *Connection) Send(msg interface{}) error {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
 
+	category := extractCategory(data)
 	select {
-	case c.sendCh <- data:
+	case c.sendCh <- sendItem{data: data, category: category}:
 		return nil
 	default:
 		return fmt.Errorf("send buffer full, message dropped")
@@ -133,12 +161,24 @@ func (c *Connection) SendSync(msg interface{}) error {
 		return fmt.Errorf("marshaling message: %w", err)
 	}
 
+	category := extractCategory(data)
 	select {
-	case c.sendCh <- data:
+	case c.sendCh <- sendItem{data: data, category: category}:
 		return nil
 	case <-c.stopCh:
 		return fmt.Errorf("connection closed")
 	}
+}
+
+// extractCategory peeks at the "type" field in a JSON message to determine its rate-limit category.
+func extractCategory(data []byte) string {
+	var env struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &env) == nil {
+		return msgCategory(env.Type)
+	}
+	return "other"
 }
 
 // Close gracefully closes the connection.
@@ -213,19 +253,16 @@ func (c *Connection) writePump(ctx context.Context) {
 			return
 		case <-c.stopCh:
 			return
-		case data := <-c.sendCh:
-			// Respect server retry_after before sending
-			if until := c.retryUntil.Load(); until > 0 {
+		case item := <-c.sendCh:
+			// Check per-category rate limit
+			retry := c.getRetryUntil(item.category)
+			if until := retry.Load(); until > 0 {
 				delay := time.Until(time.UnixMilli(until))
 				if delay > 0 {
-					log.Printf("[ws] rate limited, waiting %v before sending", delay.Truncate(time.Millisecond))
-					select {
-					case <-time.After(delay):
-					case <-ctx.Done():
-						return
-					case <-c.stopCh:
-						return
-					}
+					// Drop the message — don't block other categories.
+					// The scheduler/WAL will retry later.
+					log.Printf("[ws] %s rate-limited for %v, dropping message", item.category, delay.Truncate(time.Millisecond))
+					continue
 				}
 			}
 
@@ -234,7 +271,7 @@ func (c *Connection) writePump(ctx context.Context) {
 				c.connMu.Unlock()
 				return
 			}
-			err := c.conn.WriteMessage(websocket.TextMessage, data)
+			err := c.conn.WriteMessage(websocket.TextMessage, item.data)
 			c.connMu.Unlock()
 			if err != nil {
 				return
@@ -290,20 +327,26 @@ func (c *Connection) handleMessage(data []byte) {
 	case "error":
 		var msg protocol.ErrorMessage
 		if json.Unmarshal(data, &msg) == nil {
-			log.Printf("[ws] server error: code=%s retry_after=%d", msg.Code, msg.RetryAfter)
+			log.Printf("[ws] server error: code=%s category=%s retry_after=%d", msg.Code, msg.Category, msg.RetryAfter)
 			if msg.Code == "RATE_LIMITED" {
-				// Use server-provided backoff, or default to 10s if not specified
 				waitSec := msg.RetryAfter
 				if waitSec <= 0 {
 					waitSec = 10
 				}
+				cat := msg.Category
+				if cat == "" {
+					cat = "other" // fallback for old servers without category
+				}
 				until := time.Now().Add(time.Duration(waitSec) * time.Second)
-				c.retryUntil.Store(until.UnixMilli())
-				log.Printf("[ws] rate limited, pausing sends for %ds (until %s)", waitSec, until.Format("15:04:05"))
+				c.getRetryUntil(cat).Store(until.UnixMilli())
+				log.Printf("[ws] %s rate limited, pausing for %ds (until %s)", cat, waitSec, until.Format("15:04:05"))
 			} else if msg.RetryAfter > 0 {
+				// Non-rate-limit error with retry_after — apply to all categories
 				until := time.Now().Add(time.Duration(msg.RetryAfter) * time.Second)
-				c.retryUntil.Store(until.UnixMilli())
-				log.Printf("[ws] pausing sends for %ds (until %s)", msg.RetryAfter, until.Format("15:04:05"))
+				for _, cat := range []string{"live", "batch", "wal", "other"} {
+					c.getRetryUntil(cat).Store(until.UnixMilli())
+				}
+				log.Printf("[ws] pausing all sends for %ds (until %s)", msg.RetryAfter, until.Format("15:04:05"))
 			}
 		}
 

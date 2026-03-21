@@ -296,7 +296,7 @@ func TestConnectionSendBufferFull(t *testing.T) {
 
 	// Fill the send buffer (256 capacity)
 	for i := 0; i < 256; i++ {
-		conn.sendCh <- []byte("test")
+		conn.sendCh <- sendItem{data: []byte("test"), category: "other"}
 	}
 
 	// Next send should return error (buffer full)

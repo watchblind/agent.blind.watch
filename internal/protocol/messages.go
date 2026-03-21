@@ -114,6 +114,7 @@ type DisconnectMessage struct {
 type ErrorMessage struct {
 	Type       string `json:"type"` // "error"
 	Code       string `json:"code"`
+	Category   string `json:"category,omitempty"`   // rate-limit category: "live", "batch", "wal", "other"
 	RetryAfter int    `json:"retry_after,omitempty"`
 }
 
