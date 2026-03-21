@@ -418,13 +418,13 @@ func (s *Scheduler) sendLive(snap *Snapshot) {
 	}
 }
 
-// flushBufferAsLive drains the batch buffer and sends each snapshot as an
-// individual "live" message. Called on idle→live transition so the dashboard
-// receives every buffered point in the same format as real-time data.
+// flushBufferAsLive sends buffered snapshots as live messages to the dashboard
+// without draining the buffer. The buffer is kept intact so batch sends still
+// persist all data to AE.
 func (s *Scheduler) flushBufferAsLive() {
 	s.batchMu.Lock()
-	snapshots := s.batchBuf
-	s.batchBuf = nil
+	snapshots := make([]Snapshot, len(s.batchBuf))
+	copy(snapshots, s.batchBuf)
 	s.batchMu.Unlock()
 
 	if len(snapshots) == 0 {
