@@ -171,11 +171,14 @@ func TestConnectionSendAndReceiveAck(t *testing.T) {
 
 	// Send a batch message
 	msg := protocol.BatchMessage{
-		Type:       "batch",
-		BatchID:    "test_batch_001",
-		Epoch:      1,
-		Timestamp:  time.Now().Unix(),
-		EncPayload: "encrypted_data_here",
+		Type:    "batch",
+		BatchID: "test_batch_001",
+		Epoch:   1,
+		Entries: []protocol.BatchEntry{{
+			Epoch:      1,
+			Timestamp:  time.Now().Unix(),
+			EncPayload: "encrypted_data_here",
+		}},
 	}
 
 	if err := conn.Send(msg); err != nil {
@@ -377,11 +380,14 @@ func TestConnectionPayloadOpacity(t *testing.T) {
 
 	// Send a batch with an "encrypted" payload
 	msg := protocol.BatchMessage{
-		Type:       "batch",
-		BatchID:    "opacity_test",
-		Epoch:      1,
-		Timestamp:  time.Now().Unix(),
-		EncPayload: "base64_encrypted_blob_that_server_cannot_read",
+		Type:    "batch",
+		BatchID: "opacity_test",
+		Epoch:   1,
+		Entries: []protocol.BatchEntry{{
+			Epoch:      1,
+			Timestamp:  time.Now().Unix(),
+			EncPayload: "base64_encrypted_blob_that_server_cannot_read",
+		}},
 	}
 	conn.Send(msg)
 
@@ -399,8 +405,8 @@ func TestConnectionPayloadOpacity(t *testing.T) {
 			t.Fatal("failed to unmarshal batch")
 		}
 
-		// Server sees enc_payload but can't derive metrics from it
-		if batch.EncPayload != "base64_encrypted_blob_that_server_cannot_read" {
+		// Server sees entries with enc_payload but can't derive metrics from it
+		if len(batch.Entries) == 0 || batch.Entries[0].EncPayload != "base64_encrypted_blob_that_server_cannot_read" {
 			t.Error("payload was modified in transit")
 		}
 
@@ -409,7 +415,7 @@ func TestConnectionPayloadOpacity(t *testing.T) {
 		json.Unmarshal(raw, &rawMap)
 		for key := range rawMap {
 			switch key {
-			case "type", "batch_id", "agent_id", "epoch", "timestamp", "enc_payload":
+			case "type", "batch_id", "agent_id", "epoch", "entries":
 				// Expected metadata fields
 			default:
 				t.Errorf("unexpected field in batch message: %s (potential metadata leak)", key)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/watchblind/agent/internal/collector"
 	"github.com/watchblind/agent/internal/crypto"
+	"github.com/watchblind/agent/internal/protocol"
 	"github.com/watchblind/agent/internal/transport"
 	"github.com/watchblind/agent/internal/wal"
 )
@@ -77,24 +78,6 @@ func TestSetPace_SignalsPaceChanged(t *testing.T) {
 	}
 }
 
-func TestSetPace_IdleResetsCollectInterval(t *testing.T) {
-	s := newTestScheduler(t)
-
-	// Switch to live with a custom collect interval.
-	s.SetPace(2000, 2000)
-
-	// Switch back to idle — collectInterval should reset to 10s.
-	s.SetPace(0, 0)
-
-	s.mu.RLock()
-	ci := s.collectInterval
-	s.mu.RUnlock()
-
-	if ci != 10*time.Second {
-		t.Fatalf("expected collectInterval=10s after idle reset, got %v", ci)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // 2. GetMode returns correct mode
 // ---------------------------------------------------------------------------
@@ -152,38 +135,22 @@ func TestTimeUntilNextBatch_BoundedByInterval(t *testing.T) {
 
 	d := s.timeUntilNextBatch()
 
-	s.mu.RLock()
-	interval := s.batchInterval
-	s.mu.RUnlock()
-
-	if d > interval {
-		t.Fatalf("duration %v exceeds batch interval %v", d, interval)
+	if d > batchInterval {
+		t.Fatalf("duration %v exceeds batch interval %v", d, batchInterval)
 	}
 }
 
 func TestTimeUntilNextBatch_AlignedToInterval(t *testing.T) {
 	s := newTestScheduler(t)
 
-	s.mu.RLock()
-	interval := s.batchInterval
-	s.mu.RUnlock()
-
 	now := time.Now()
 	d := s.timeUntilNextBatch()
 	nextBatch := now.Add(d)
 
-	// The next batch time, when truncated to the interval, should equal itself
-	// (within a small tolerance for execution jitter). That means it lands
-	// exactly on a clock-aligned boundary.
-	truncated := nextBatch.Truncate(interval)
+	truncated := nextBatch.Truncate(batchInterval)
 
-	// nextBatch should be very close to truncated + interval (since Truncate
-	// rounds down, and we want the *next* boundary).
-	// Actually: nextBatch = Truncate(now, interval) + interval, so
-	// nextBatch.Truncate(interval) should equal nextBatch (modulo jitter).
-	// Simpler check: nextBatch should equal truncated OR truncated+interval.
 	diffFromLower := nextBatch.Sub(truncated)
-	if diffFromLower > 2*time.Second && (interval-diffFromLower) > 2*time.Second {
+	if diffFromLower > 2*time.Second && (batchInterval-diffFromLower) > 2*time.Second {
 		t.Fatalf("next batch time is not clock-aligned: offset from boundary = %v", diffFromLower)
 	}
 }
@@ -263,10 +230,10 @@ func TestSendBatch_EmptyBufferNoOp(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Encryption of batch data
+// 5. Encryption of batch data — WAL stores serialized entries array
 // ---------------------------------------------------------------------------
 
-func TestSendBatch_ProducesEncryptedPayload(t *testing.T) {
+func TestSendBatch_ProducesEncryptedEntries(t *testing.T) {
 	enc, err := crypto.NewEncryptor()
 	if err != nil {
 		t.Fatalf("creating encryptor: %v", err)
@@ -293,7 +260,7 @@ func TestSendBatch_ProducesEncryptedPayload(t *testing.T) {
 
 	s.sendBatch()
 
-	// The WAL entry should contain encrypted data that we can decrypt back.
+	// The WAL entry should contain a JSON array of BatchEntry (entries with encrypted payloads).
 	entries, err := w.Pending()
 	if err != nil {
 		t.Fatalf("reading WAL: %v", err)
@@ -302,25 +269,44 @@ func TestSendBatch_ProducesEncryptedPayload(t *testing.T) {
 		t.Fatalf("expected 1 WAL entry, got %d", len(entries))
 	}
 
-	plaintext, err := enc.Decrypt(entries[0].EncPayload)
-	if err != nil {
-		t.Fatalf("decrypting WAL payload: %v", err)
+	// Parse the WAL payload as entries array
+	var batchEntries []protocol.BatchEntry
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries); err != nil {
+		t.Fatalf("unmarshaling WAL entries: %v", err)
+	}
+	if len(batchEntries) != 2 {
+		t.Fatalf("expected 2 batch entries, got %d", len(batchEntries))
 	}
 
-	var decoded []Snapshot
-	if err := json.Unmarshal(plaintext, &decoded); err != nil {
-		t.Fatalf("unmarshaling decrypted payload: %v", err)
+	// Decrypt each entry and verify content
+	for i, be := range batchEntries {
+		plaintext, err := enc.Decrypt(be.EncPayload)
+		if err != nil {
+			t.Fatalf("decrypting entry %d: %v", i, err)
+		}
+		var mp MetricPayload
+		if err := json.Unmarshal(plaintext, &mp); err != nil {
+			t.Fatalf("unmarshaling entry %d: %v", i, err)
+		}
+		if mp.Timestamp != original[i].Timestamp {
+			t.Fatalf("entry %d: expected timestamp %d, got %d", i, original[i].Timestamp, mp.Timestamp)
+		}
 	}
 
-	if len(decoded) != 2 {
-		t.Fatalf("expected 2 snapshots in decrypted payload, got %d", len(decoded))
+	// Verify first entry
+	plain0, _ := enc.Decrypt(batchEntries[0].EncPayload)
+	var mp0 MetricPayload
+	json.Unmarshal(plain0, &mp0)
+	if mp0.Metrics[0].Name != "cpu" || mp0.Metrics[0].Value != 42.0 {
+		t.Fatalf("entry 0 mismatch: %+v", mp0)
 	}
 
-	if decoded[0].Metrics[0].Name != "cpu" || decoded[0].Metrics[0].Value != 42.0 {
-		t.Fatalf("snapshot 0 mismatch: %+v", decoded[0])
-	}
-	if decoded[1].Metrics[0].Name != "mem" || decoded[1].Metrics[0].Value != 80.5 {
-		t.Fatalf("snapshot 1 mismatch: %+v", decoded[1])
+	// Verify second entry
+	plain1, _ := enc.Decrypt(batchEntries[1].EncPayload)
+	var mp1 MetricPayload
+	json.Unmarshal(plain1, &mp1)
+	if mp1.Metrics[0].Name != "mem" || mp1.Metrics[0].Value != 80.5 {
+		t.Fatalf("entry 1 mismatch: %+v", mp1)
 	}
 }
 
@@ -348,10 +334,14 @@ func TestSendBatch_EncryptedPayloadDiffersFromPlaintext(t *testing.T) {
 		t.Fatalf("reading WAL: %v", err)
 	}
 
-	plainJSON, _ := json.Marshal([]Snapshot{*snap})
+	// WAL payload is a JSON array of BatchEntry — the enc_payload within should not be plaintext
+	var batchEntries []protocol.BatchEntry
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries); err != nil {
+		t.Fatalf("unmarshaling: %v", err)
+	}
 
-	// The encrypted payload must not contain the plaintext.
-	if entries[0].EncPayload == string(plainJSON) {
+	plainJSON, _ := json.Marshal(MetricPayload{Timestamp: 999, Metrics: snap.Metrics})
+	if batchEntries[0].EncPayload == string(plainJSON) {
 		t.Fatal("encrypted payload matches raw plaintext — encryption did not occur")
 	}
 }
@@ -425,13 +415,9 @@ func TestAckBatch_RemovesFromWAL(t *testing.T) {
 	}
 }
 
-func TestMultipleBatches_AccumulateInWAL(t *testing.T) {
+func TestMultipleBatches_SingleWALEntry(t *testing.T) {
 	s := newTestScheduler(t)
 
-	// sendBatch generates batch IDs using Unix seconds + agentID. When all
-	// three calls happen within the same second, they produce the same ID and
-	// the WAL file gets overwritten. To avoid that, we send separate batches
-	// with distinct agentIDs by directly writing to the WAL.
 	for i := 0; i < 3; i++ {
 		snap := &Snapshot{
 			Timestamp: int64(1000 + i),
@@ -440,30 +426,68 @@ func TestMultipleBatches_AccumulateInWAL(t *testing.T) {
 		s.bufferSnapshot(snap)
 	}
 
-	// All three snapshots go into one batch.
+	// All three snapshots go into one batch = one WAL entry.
 	s.sendBatch()
 
 	if s.wal.Count() != 1 {
 		t.Fatalf("expected 1 WAL entry for single sendBatch call, got %d", s.wal.Count())
 	}
 
-	// Verify the WAL entry contains all 3 snapshots when decrypted.
+	// Verify the WAL entry contains all 3 entries.
 	entries, err := s.wal.Pending()
 	if err != nil {
 		t.Fatalf("reading WAL: %v", err)
 	}
 
-	plaintext, err := s.encryptor.Decrypt(entries[0].EncPayload)
-	if err != nil {
-		t.Fatalf("decrypting: %v", err)
+	var batchEntries []protocol.BatchEntry
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries); err != nil {
+		t.Fatalf("unmarshaling WAL entries: %v", err)
 	}
 
-	var decoded []Snapshot
-	if err := json.Unmarshal(plaintext, &decoded); err != nil {
-		t.Fatalf("unmarshaling: %v", err)
+	if len(batchEntries) != 3 {
+		t.Fatalf("expected 3 batch entries in WAL, got %d", len(batchEntries))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 7. Retention buffer
+// ---------------------------------------------------------------------------
+
+func TestSetRetention_StoresSnapshots(t *testing.T) {
+	s := newTestScheduler(t)
+
+	snaps := []Snapshot{
+		{Timestamp: 1000, Metrics: []collector.Metric{{Name: "cpu", Value: 0.5}}},
+		{Timestamp: 1010, Metrics: []collector.Metric{{Name: "cpu", Value: 0.6}}},
 	}
 
-	if len(decoded) != 3 {
-		t.Fatalf("expected 3 snapshots in WAL entry, got %d", len(decoded))
+	s.setRetention(snaps, 1)
+
+	s.retentionMu.Lock()
+	count := len(s.retentionBuf)
+	epoch := s.retentionEpoch
+	s.retentionMu.Unlock()
+
+	if count != 2 {
+		t.Fatalf("expected 2 retained snapshots, got %d", count)
+	}
+	if epoch != 1 {
+		t.Fatalf("expected retention epoch 1, got %d", epoch)
+	}
+}
+
+func TestSendBatch_SetsRetention(t *testing.T) {
+	s := newTestScheduler(t)
+
+	snap := &Snapshot{Timestamp: 1000, Metrics: []collector.Metric{{Name: "cpu", Value: 0.5}}}
+	s.bufferSnapshot(snap)
+	s.sendBatch()
+
+	s.retentionMu.Lock()
+	count := len(s.retentionBuf)
+	s.retentionMu.Unlock()
+
+	if count != 1 {
+		t.Fatalf("expected 1 retained snapshot after sendBatch, got %d", count)
 	}
 }
