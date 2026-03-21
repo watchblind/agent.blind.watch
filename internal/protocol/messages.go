@@ -10,6 +10,14 @@ type BatchMessage struct {
 	BatchID    string `json:"batch_id"`
 	Epoch      int    `json:"epoch"`
 	Timestamp  int64  `json:"timestamp"`
+	EncPayload string `json:"enc_payload,omitempty"` // legacy single-blob (unused, kept for compat)
+	Entries    []BatchEntry `json:"entries,omitempty"`    // per-snapshot encrypted entries
+}
+
+// BatchEntry is a single encrypted snapshot within a batch.
+type BatchEntry struct {
+	Epoch      int    `json:"epoch"`
+	Timestamp  int64  `json:"timestamp"`
 	EncPayload string `json:"enc_payload"`
 }
 
@@ -33,11 +41,12 @@ type WALSyncEntry struct {
 }
 
 type FlushMessage struct {
-	Type       string `json:"type"` // "flush"
-	BatchID    string `json:"batch_id"`
-	Epoch      int    `json:"epoch"`
-	Timestamp  int64  `json:"timestamp"`
-	EncPayload string `json:"enc_payload"`
+	Type       string       `json:"type"` // "flush"
+	BatchID    string       `json:"batch_id"`
+	Epoch      int          `json:"epoch"`
+	Timestamp  int64        `json:"timestamp"`
+	EncPayload string       `json:"enc_payload,omitempty"` // legacy single-blob (unused)
+	Entries    []BatchEntry `json:"entries,omitempty"`      // per-snapshot encrypted entries
 }
 
 type LiveProcMessage struct {
@@ -52,7 +61,8 @@ type BatchProcMessage struct {
 	BatchID    string `json:"batch_id"`
 	Epoch      int    `json:"epoch"`
 	Timestamp  int64  `json:"timestamp"`
-	EncPayload string `json:"enc_payload"`
+	EncPayload string `json:"enc_payload,omitempty"` // legacy single-blob (unused)
+	Entries    []BatchEntry `json:"entries,omitempty"`    // per-snapshot encrypted entries
 }
 
 type AlertMessage struct {
