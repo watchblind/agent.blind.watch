@@ -231,10 +231,11 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 				continue
 			}
 
+			// Always buffer for batch persistence to AE
+			s.bufferSnapshot(snap)
+
 			if mode == ModeLive {
 				s.sendLive(snap)
-			} else {
-				s.bufferSnapshot(snap)
 			}
 
 			// Reset ticker if interval changed
@@ -246,9 +247,7 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 			}
 
 		case <-batchTimer.C:
-			if mode == ModeIdle {
-				s.sendBatch()
-			}
+			s.sendBatch()
 			batchTimer.Reset(s.timeUntilNextBatch())
 		}
 	}
