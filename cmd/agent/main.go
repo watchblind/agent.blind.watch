@@ -24,6 +24,7 @@ import (
 	"github.com/watchblind/agent/internal/protocol"
 	"github.com/watchblind/agent/internal/provision"
 	"github.com/watchblind/agent/internal/scheduler"
+	"github.com/watchblind/agent/internal/sdnotify"
 	"github.com/watchblind/agent/internal/sender"
 	"github.com/watchblind/agent/internal/transport"
 	"github.com/watchblind/agent/internal/wal"
@@ -407,6 +408,21 @@ func main() {
 		go conn.Run(ctx)
 		go sched.Run(ctx)
 		go logMgr.Run(ctx)
+
+		// systemd watchdog: send READY and periodic WATCHDOG pings
+		sdnotify.Ready()
+		go func() {
+			ticker := time.NewTicker(2 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					sdnotify.Watchdog()
+				}
+			}
+		}()
 
 		fmt.Printf("\nAgent running (WebSocket mode). Press Ctrl+C to stop.\n")
 		fmt.Printf("  WAL entries: %d pending\n", w.Count())
