@@ -7,9 +7,6 @@ on:
 
 permissions:
   contents: write
-  packages: write
-  id-token: write
-  attestations: write
 
 jobs:
   test:
@@ -46,12 +43,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Attest build provenance (binaries)
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/blindwatch-agent_*/**
-
-      - name: Attest build provenance (checksums)
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/checksums.sha256
