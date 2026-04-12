@@ -295,7 +295,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute=yes is omitted — Go runtime requires W+X memory
 
 [Install]
 WantedBy=multi-user.target
