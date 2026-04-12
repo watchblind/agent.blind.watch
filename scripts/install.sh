@@ -67,6 +67,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --- Sudo helper: run a command with sudo, passing through needed vars ---
+as_root() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 # --- Platform detection ---
 detect_platform() {
     local os arch
@@ -89,10 +98,6 @@ detect_platform() {
 
 # --- Check prerequisites ---
 check_prerequisites() {
-    if [[ $EUID -ne 0 ]] && [[ "$UPGRADE" == false ]]; then
-        fatal "This installer must be run as root (sudo). The agent runs as an unprivileged user."
-    fi
-
     for cmd in sha256sum tar; do
         if ! command -v "$cmd" &>/dev/null; then
             fatal "Required command not found: $cmd"
@@ -108,9 +113,16 @@ check_prerequisites() {
     if ! command -v systemctl &>/dev/null; then
         fatal "systemd is required. SysV/OpenRC are not supported."
     fi
+
+    # Verify we can get root (prompt early so user isn't surprised later)
+    if [[ $EUID -ne 0 ]]; then
+        info "Root privileges required for installation. You may be prompted for your password."
+        sudo -v || fatal "Could not obtain root privileges"
+    fi
 }
 
 # --- Download helper: gh with curl fallback ---
+# Runs as the invoking user (not root) so gh auth works
 gh_download() {
     local repo="$1"
     local tag="$2"
@@ -131,6 +143,7 @@ gh_download() {
 }
 
 # --- Resolve version ---
+# Runs as the invoking user (not root) so gh auth works
 resolve_version() {
     if [[ -n "$VERSION" ]]; then
         echo "$VERSION"
@@ -158,6 +171,7 @@ resolve_version() {
 }
 
 # --- Download and verify ---
+# Runs as the invoking user (not root) so gh auth works
 download_and_verify() {
     local version="$1"
     local platform="$2"
@@ -209,21 +223,21 @@ download_and_verify() {
     echo "${tmp_dir}/${BINARY_NAME}"
 }
 
-# --- Install binary ---
+# --- Install binary (requires root) ---
 install_binary() {
     local binary_path="$1"
 
     if [[ "$UPGRADE" == true ]]; then
         info "Stopping ${SERVICE_NAME}..."
-        systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+        as_root systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
     fi
 
     info "Installing binary to ${INSTALL_DIR}/${BINARY_NAME}..."
-    install -m 0755 "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"
+    as_root install -m 0755 "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"
     ok "Binary installed"
 }
 
-# --- Create system user ---
+# --- Create system user (requires root) ---
 create_user() {
     if id "${SERVICE_USER}" &>/dev/null; then
         return
@@ -232,20 +246,20 @@ create_user() {
     info "Creating system user: ${SERVICE_USER}"
     local nologin="/usr/sbin/nologin"
     [[ -x "/usr/bin/nologin" ]] && nologin="/usr/bin/nologin"
-    useradd --system --no-create-home --shell "$nologin" "${SERVICE_USER}"
+    as_root useradd --system --no-create-home --shell "$nologin" "${SERVICE_USER}"
     ok "User created"
 }
 
-# --- Create data directory ---
+# --- Create data directory (requires root) ---
 create_data_dir() {
     info "Creating data directory: ${DATA_DIR}"
-    mkdir -p "${DATA_DIR}/wal"
-    chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}"
-    chmod 0700 "${DATA_DIR}"
+    as_root mkdir -p "${DATA_DIR}/wal"
+    as_root chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}"
+    as_root chmod 0700 "${DATA_DIR}"
     ok "Data directory ready"
 }
 
-# --- Install systemd unit ---
+# --- Install systemd unit (requires root) ---
 install_systemd() {
     if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] && [[ "$UPGRADE" == true ]]; then
         info "Systemd unit already exists, keeping current"
@@ -253,7 +267,7 @@ install_systemd() {
     fi
 
     info "Installing systemd unit..."
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" << UNIT
+    as_root tee "/etc/systemd/system/${SERVICE_NAME}.service" > /dev/null << UNIT
 [Unit]
 Description=blind.watch monitoring agent
 Documentation=https://github.com/${REPO}
@@ -287,13 +301,13 @@ MemoryDenyWriteExecute=yes
 WantedBy=multi-user.target
 UNIT
 
-    systemctl daemon-reload
+    as_root systemctl daemon-reload
     ok "Systemd unit installed"
 }
 
-# --- First boot provisioning ---
+# --- First boot provisioning (requires root for sudo -u) ---
 run_first_boot() {
-    if [[ -f "${DATA_DIR}/state.json" ]]; then
+    if as_root test -f "${DATA_DIR}/state.json"; then
         info "Agent already provisioned, skipping first boot"
         return
     fi
@@ -304,8 +318,7 @@ run_first_boot() {
 
     info "Running first-boot provisioning..."
 
-    # Run as the service user
-    sudo -u "${SERVICE_USER}" \
+    as_root sudo -u "${SERVICE_USER}" \
         BW_TOKEN="${BW_TOKEN}" \
         BW_SECRET="${BW_SECRET}" \
         BW_API_URL="${API_URL}" \
@@ -318,11 +331,11 @@ run_first_boot() {
     ok "Provisioning complete"
 }
 
-# --- Start service ---
+# --- Start service (requires root) ---
 start_service() {
     info "Starting ${SERVICE_NAME}..."
-    systemctl enable "${SERVICE_NAME}"
-    systemctl start "${SERVICE_NAME}"
+    as_root systemctl enable "${SERVICE_NAME}"
+    as_root systemctl start "${SERVICE_NAME}"
 
     # Wait briefly and check status
     sleep 2
@@ -343,6 +356,7 @@ main() {
 
     check_prerequisites
 
+    # Phase 1: Download & verify (runs as invoking user — gh auth works)
     local platform version binary_path
     platform=$(detect_platform)
     info "Platform: ${platform}"
@@ -352,6 +366,7 @@ main() {
 
     binary_path=$(download_and_verify "$version" "$platform")
 
+    # Phase 2: Install (elevates to root via as_root helper)
     install_binary "$binary_path"
     create_user
     create_data_dir
