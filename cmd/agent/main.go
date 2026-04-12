@@ -214,6 +214,9 @@ func main() {
 		log.Fatalf("Failed to init log manager: %v", err)
 	}
 
+	// Wire log manager into scheduler for live mode control and replay
+	sched.SetLogManager(logMgr)
+
 	// Wire callbacks
 	conn.OnAck(func(batchID string) {
 		sched.AckBatch(batchID)
@@ -221,10 +224,6 @@ func main() {
 
 	conn.OnPace(func(intervalMS, collectMS int) {
 		sched.SetPace(intervalMS, collectMS)
-		// Flush buffered logs when switching to live mode (dashboard connected)
-		if intervalMS > 0 {
-			logMgr.FlushNow()
-		}
 	})
 
 	// Config push from server — decrypt E2E encrypted config, then apply
