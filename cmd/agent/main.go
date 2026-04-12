@@ -118,6 +118,10 @@ func main() {
 		epoch = state.Epoch
 
 		fmt.Println("[provision] first boot complete — provisioning secret discarded")
+		fmt.Printf("  agent_id: %s\n", agentID)
+		fmt.Printf("  api_url:  %s\n", apiURL)
+		fmt.Printf("  epoch:    %d\n", epoch)
+		return
 
 	} else if provision.IsProvisioned(*dataDir) {
 		// Subsequent boot: recover DEK from server

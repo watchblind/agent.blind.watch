@@ -318,7 +318,7 @@ run_first_boot() {
 
     info "Running first-boot provisioning..."
 
-    as_root sudo -u "${SERVICE_USER}" \
+    sudo -u "${SERVICE_USER}" \
         BW_TOKEN="${BW_TOKEN}" \
         BW_SECRET="${BW_SECRET}" \
         BW_API_URL="${API_URL}" \
