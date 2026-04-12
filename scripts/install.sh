@@ -1,14 +1,12 @@
 #!/bin/bash
 # blind.watch agent installer
 # Usage:
-#   curl -sSL https://get.blind.watch/agent | bash
-#
-# Environment variables (set BEFORE running):
-#   BW_TOKEN    - Agent authentication token (required)
-#   BW_SECRET   - Provisioning secret (required)
-#   BW_API_URL  - API URL (default: https://api.blind.watch)
+#   curl -sSL https://get.blind.watch/agent | bash -s -- --token TOKEN --secret SECRET
 #
 # Options:
+#   --token TOKEN          Agent authentication token (required for first install)
+#   --secret SECRET        Provisioning secret (required for first install)
+#   --api-url URL          API URL (default: https://api.blind.watch)
 #   --upgrade              Upgrade existing installation
 #   --skip-attestation     Skip SLSA attestation verification
 #   --version VERSION      Install specific version (default: latest)
@@ -16,13 +14,15 @@
 
 set -euo pipefail
 
-REPO="watchblind/agent"
+REPO="watchblind/agent.blind.watch"
 BINARY_NAME="blindwatch-agent"
 INSTALL_DIR="/usr/local/bin"
 DATA_DIR="/var/lib/blindwatch"
 SERVICE_USER="blindwatch"
 SERVICE_NAME="blindwatch-agent"
 API_URL="${BW_API_URL:-https://api.blind.watch}"
+BW_TOKEN="${BW_TOKEN:-}"
+BW_SECRET="${BW_SECRET:-}"
 VERSION=""
 UPGRADE=false
 SKIP_ATTESTATION=false
@@ -43,23 +43,24 @@ fatal() { error "$*"; exit 1; }
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --upgrade)       UPGRADE=true; shift ;;
-        --skip-attestation) SKIP_ATTESTATION=true; shift ;;
-        --version)       VERSION="$2"; shift 2 ;;
-        --data-dir)      DATA_DIR="$2"; shift 2 ;;
+        --token)             BW_TOKEN="$2"; shift 2 ;;
+        --secret)            BW_SECRET="$2"; shift 2 ;;
+        --api-url)           API_URL="$2"; shift 2 ;;
+        --upgrade)           UPGRADE=true; shift ;;
+        --skip-attestation)  SKIP_ATTESTATION=true; shift ;;
+        --version)           VERSION="$2"; shift 2 ;;
+        --data-dir)          DATA_DIR="$2"; shift 2 ;;
         -h|--help)
             echo "Usage: install.sh [OPTIONS]"
             echo ""
             echo "Options:"
+            echo "  --token TOKEN          Agent token (required for first install)"
+            echo "  --secret SECRET        Provisioning secret (required for first install)"
+            echo "  --api-url URL          API URL (default: https://api.blind.watch)"
             echo "  --upgrade              Upgrade existing installation"
             echo "  --skip-attestation     Skip SLSA attestation verification"
             echo "  --version VERSION      Install specific version (default: latest)"
             echo "  --data-dir DIR         Data directory (default: /var/lib/blindwatch)"
-            echo ""
-            echo "Environment variables:"
-            echo "  BW_TOKEN   Agent token (required for first install)"
-            echo "  BW_SECRET  Provisioning secret (required for first install)"
-            echo "  BW_API_URL API URL (default: https://api.blind.watch)"
             exit 0
             ;;
         *) fatal "Unknown option: $1" ;;
@@ -92,16 +93,41 @@ check_prerequisites() {
         fatal "This installer must be run as root (sudo). The agent runs as an unprivileged user."
     fi
 
-    for cmd in curl sha256sum; do
+    for cmd in sha256sum tar; do
         if ! command -v "$cmd" &>/dev/null; then
             fatal "Required command not found: $cmd"
         fi
     done
 
+    # Need either gh (for private repo) or curl (for public repo)
+    if ! command -v gh &>/dev/null && ! command -v curl &>/dev/null; then
+        fatal "Either gh (GitHub CLI) or curl is required"
+    fi
+
     # Check systemd
     if ! command -v systemctl &>/dev/null; then
         fatal "systemd is required. SysV/OpenRC are not supported."
     fi
+}
+
+# --- Download helper: gh with curl fallback ---
+gh_download() {
+    local repo="$1"
+    local tag="$2"
+    local asset="$3"
+    local output="$4"
+
+    if command -v gh &>/dev/null; then
+        gh release download "$tag" --repo "$repo" --pattern "$asset" --output "$output" 2>/dev/null && return 0
+    fi
+
+    # Fallback to curl (works when repo is public)
+    if command -v curl &>/dev/null; then
+        local url="https://github.com/${repo}/releases/download/${tag}/${asset}"
+        curl -sSL -o "$output" "$url" 2>/dev/null && return 0
+    fi
+
+    return 1
 }
 
 # --- Resolve version ---
@@ -113,11 +139,18 @@ resolve_version() {
 
     info "Fetching latest version..."
     local latest
-    latest=$(curl -sSL -H "Accept: application/json" \
-        "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 
-    if [[ -z "$latest" ]]; then
+    if command -v gh &>/dev/null; then
+        latest=$(gh release list --repo "${REPO}" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null)
+    fi
+
+    if [[ -z "${latest:-}" ]] && command -v curl &>/dev/null; then
+        latest=$(curl -sSL -H "Accept: application/json" \
+            "https://api.github.com/repos/${REPO}/releases/latest" \
+            | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    fi
+
+    if [[ -z "${latest:-}" ]]; then
         fatal "Could not determine latest version. Use --version to specify."
     fi
 
@@ -129,23 +162,22 @@ download_and_verify() {
     local version="$1"
     local platform="$2"
     local archive_name="${BINARY_NAME}_${version#v}_${platform}.tar.gz"
-    local download_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
-    local checksums_url="https://github.com/${REPO}/releases/download/${version}/checksums.sha256"
+    local checksums_name="checksums.txt"
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
     info "Downloading ${archive_name}..."
-    curl -sSL -o "${tmp_dir}/${archive_name}" "$download_url" \
-        || fatal "Download failed: ${download_url}"
+    gh_download "$REPO" "$version" "$archive_name" "${tmp_dir}/${archive_name}" \
+        || fatal "Download failed: ${archive_name}"
 
     info "Downloading checksums..."
-    curl -sSL -o "${tmp_dir}/checksums.sha256" "$checksums_url" \
+    gh_download "$REPO" "$version" "$checksums_name" "${tmp_dir}/checksums.txt" \
         || fatal "Checksums download failed"
 
     # Verify checksum
     info "Verifying SHA-256 checksum..."
     local expected
-    expected=$(grep "${archive_name}" "${tmp_dir}/checksums.sha256" | awk '{print $1}')
+    expected=$(grep "${archive_name}" "${tmp_dir}/checksums.txt" | awk '{print $1}')
     if [[ -z "$expected" ]]; then
         fatal "Archive not found in checksums file"
     fi
@@ -198,7 +230,9 @@ create_user() {
     fi
 
     info "Creating system user: ${SERVICE_USER}"
-    useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+    local nologin="/usr/sbin/nologin"
+    [[ -x "/usr/bin/nologin" ]] && nologin="/usr/bin/nologin"
+    useradd --system --no-create-home --shell "$nologin" "${SERVICE_USER}"
     ok "User created"
 }
 
@@ -219,18 +253,18 @@ install_systemd() {
     fi
 
     info "Installing systemd unit..."
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" << 'UNIT'
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" << UNIT
 [Unit]
 Description=blind.watch monitoring agent
-Documentation=https://github.com/watchblind/agent
+Documentation=https://github.com/${REPO}
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=blindwatch
-Group=blindwatch
-ExecStart=/usr/local/bin/blindwatch-agent --data-dir /var/lib/blindwatch --wal-dir /var/lib/blindwatch/wal
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+ExecStart=${INSTALL_DIR}/${BINARY_NAME} --data-dir ${DATA_DIR} --wal-dir ${DATA_DIR}/wal
 Restart=always
 RestartSec=10
 WatchdogSec=300
@@ -240,7 +274,7 @@ LimitCORE=0
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/blindwatch
+ReadWritePaths=${DATA_DIR}
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
@@ -264,8 +298,8 @@ run_first_boot() {
         return
     fi
 
-    if [[ -z "${BW_TOKEN:-}" ]] || [[ -z "${BW_SECRET:-}" ]]; then
-        fatal "BW_TOKEN and BW_SECRET must be set for first install"
+    if [[ -z "${BW_TOKEN}" ]] || [[ -z "${BW_SECRET}" ]]; then
+        fatal "Token and secret are required for first install. Use --token and --secret flags."
     fi
 
     info "Running first-boot provisioning..."
@@ -340,7 +374,7 @@ main() {
     # Cleanup
     rm -rf "$(dirname "$binary_path")"
 
-    # Clear env vars
+    # Clear sensitive vars
     unset BW_TOKEN BW_SECRET 2>/dev/null || true
 }
 
