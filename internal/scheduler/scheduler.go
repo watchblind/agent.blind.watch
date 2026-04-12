@@ -24,25 +24,17 @@ const (
 )
 
 // Snapshot is a timestamped collection of metrics and processes, serializable for encryption.
+// The full Snapshot (metrics + processes) is encrypted and stored in R2 — no AE size limit.
 type Snapshot struct {
 	Timestamp int64                      `json:"timestamp"`
 	Metrics   []collector.Metric         `json:"metrics"`
 	Processes []collector.ProcessSnapshot `json:"processes,omitempty"`
 }
 
-// MetricPayload is the metrics-only portion for AE persistence.
-// Combined metrics+processes exceeds AE's 16KB blob limit (~19KB),
-// so only metrics (~12KB) are stored in AE.
-type MetricPayload struct {
-	Timestamp int64              `json:"timestamp"`
-	Metrics   []collector.Metric `json:"metrics"`
-}
-
 const (
 	idleCollectInterval = 10 * time.Second
 	liveCollectInterval = 1 * time.Second
 	batchInterval       = 10 * time.Minute
-	retentionDuration   = 90 * time.Second
 )
 
 // Scheduler orchestrates metric collection, batching, encryption, and sending.
@@ -51,10 +43,12 @@ const (
 //
 // Idle path (always running): collects every 10s, buffers locally, sends ONE
 // "batch" message with all entries on 10-minute wall-clock boundaries. On ack
-// the WAL entry is deleted and entries move to a 90-second retention buffer.
+// the WAL entry is deleted. Full Snapshot (metrics + processes) is encrypted
+// and stored in R2 by the server.
 //
-// Live path (only when viewer connected): sends "live" message each second.
-// Uses single-ticker optimization — every 10th tick also appends to batch buffer.
+// Live path (purely additive, when viewer connected): sends "live" message
+// each second. Does NOT interact with idle batching — the idle ticker and
+// batch timer continue unchanged. Live data is display-only (not stored).
 type Scheduler struct {
 	agentID   string
 	epoch     int
@@ -70,18 +64,17 @@ type Scheduler struct {
 	batchMu  sync.Mutex
 	batchBuf []Snapshot
 
-	// Retention: last sent batch kept for 90s to cover AE ingestion lag.
-	// Used for replay message on live mode activation.
-	retentionMu    sync.Mutex
-	retentionBuf   []Snapshot
-	retentionEpoch int
-	retentionTimer *time.Timer
-
 	// Channel to signal pace changes to the run loop.
 	paceChanged chan struct{}
 
-	// Live tick counter for single-collector optimization.
-	liveTickCount int
+	// LogManager for replay support (set after construction).
+	logManager LogBufferProvider
+}
+
+// LogBufferProvider exposes the log manager's current buffer for replay.
+type LogBufferProvider interface {
+	BufferedEntries() []protocol.LogBatchEntry
+	SetLive(live bool)
 }
 
 func New(
@@ -102,6 +95,11 @@ func New(
 		mode:        ModeIdle,
 		paceChanged: make(chan struct{}, 1),
 	}
+}
+
+// SetLogManager sets the log manager reference for replay and live mode control.
+func (s *Scheduler) SetLogManager(lm LogBufferProvider) {
+	s.logManager = lm
 }
 
 // SetPace updates the operating mode. Called when server sends a pace message.
@@ -219,19 +217,28 @@ func deserializeWALEntries(payload string) ([]protocol.BatchEntry, error) {
 }
 
 func (s *Scheduler) runLoop(ctx context.Context) {
-	// Start with idle interval; adjusted on pace change.
-	collectTicker := time.NewTicker(idleCollectInterval)
-	defer collectTicker.Stop()
+	// Idle ticker: always runs at 10s, collects and buffers snapshots.
+	idleTicker := time.NewTicker(idleCollectInterval)
+	defer idleTicker.Stop()
 
-	// Clock-aligned batch timer (idle path).
+	// Clock-aligned batch timer: fires every 10 minutes, always runs.
 	batchTimer := time.NewTimer(s.timeUntilNextBatch())
 	defer batchTimer.Stop()
 
-	for {
-		s.mu.RLock()
-		mode := s.mode
-		s.mu.RUnlock()
+	// Live ticker: only active when a viewer is connected. Additive to idle.
+	var liveTicker *time.Ticker
+	var liveCh <-chan time.Time // nil channel when live is off (blocks forever)
 
+	stopLive := func() {
+		if liveTicker != nil {
+			liveTicker.Stop()
+			liveTicker = nil
+		}
+		liveCh = nil
+	}
+	defer stopLive()
+
+	for {
 		select {
 		case <-ctx.Done():
 			// Graceful shutdown: flush any buffered data
@@ -244,47 +251,48 @@ func (s *Scheduler) runLoop(ctx context.Context) {
 			s.mu.RUnlock()
 
 			if newMode == ModeLive {
-				// Switch to 1s ticker for live mode
-				collectTicker.Reset(liveCollectInterval)
-				s.liveTickCount = 0
+				// Start additive 1s live ticker
+				stopLive()
+				liveTicker = time.NewTicker(liveCollectInterval)
+				liveCh = liveTicker.C
 
-				// Send replay message with retained + buffered data
+				// Notify log manager to also send live entries
+				if s.logManager != nil {
+					s.logManager.SetLive(true)
+				}
+
+				// Send replay message with buffered data
 				s.sendReplay()
 
 				// Immediately collect+send a fresh snapshot
 				if snap := s.collect(ctx); snap != nil {
 					s.sendLive(snap)
-					s.liveTickCount++
 				}
 			} else {
-				// Switch back to 10s ticker for idle mode
-				collectTicker.Reset(idleCollectInterval)
-				s.liveTickCount = 0
+				// Stop live ticker, idle continues unchanged
+				stopLive()
+
+				if s.logManager != nil {
+					s.logManager.SetLive(false)
+				}
 			}
 
-		case <-collectTicker.C:
+		case <-idleTicker.C:
+			// Idle path: always runs, collects every 10s, buffers for batch
 			snap := s.collect(ctx)
-			if snap == nil {
-				continue
-			}
-
-			if mode == ModeLive {
-				// Live path: stream to dashboard every second
-				s.sendLive(snap)
-				s.liveTickCount++
-
-				// Single-collector optimization: every 10th tick, also
-				// append to the batch buffer for AE persistence.
-				if s.liveTickCount%10 == 0 {
-					s.bufferSnapshot(snap)
-				}
-			} else {
-				// Idle path: collect every 10s, buffer locally
+			if snap != nil {
 				s.bufferSnapshot(snap)
 			}
 
+		case <-liveCh:
+			// Live path: additive 1s streaming when viewer connected
+			snap := s.collect(ctx)
+			if snap != nil {
+				s.sendLive(snap)
+			}
+
 		case <-batchTimer.C:
-			// 10-minute wall-clock boundary: send batch (idle path, always runs).
+			// 10-minute wall-clock boundary: send batch (always runs).
 			s.sendBatch()
 			batchTimer.Reset(s.timeUntilNextBatch())
 		}
@@ -362,20 +370,14 @@ func (s *Scheduler) sendBatch() {
 	} else {
 		log.Printf("[scheduler] batch sent: %s (%d entries)", batchID, len(entries))
 	}
-
-	// Move snapshots to retention buffer (kept for 90s for replay)
-	s.setRetention(snapshots, epoch)
 }
 
-// encryptSnapshots encrypts each snapshot's MetricPayload individually.
+// encryptSnapshots encrypts each full Snapshot (metrics + processes) individually.
+// R2 has no size limit, so we store the complete snapshot for full-resolution history.
 func (s *Scheduler) encryptSnapshots(snapshots []Snapshot, enc *crypto.Encryptor, epoch int) []protocol.BatchEntry {
 	var entries []protocol.BatchEntry
 	for _, snap := range snapshots {
-		payload := MetricPayload{
-			Timestamp: snap.Timestamp,
-			Metrics:   snap.Metrics,
-		}
-		plaintext, err := json.Marshal(payload)
+		plaintext, err := json.Marshal(snap)
 		if err != nil {
 			log.Printf("[scheduler] marshal snapshot error: %v", err)
 			continue
@@ -394,41 +396,14 @@ func (s *Scheduler) encryptSnapshots(snapshots []Snapshot, enc *crypto.Encryptor
 	return entries
 }
 
-// setRetention stores the last sent batch for 90 seconds.
-// On live mode activation, this is replayed to the viewer.
-func (s *Scheduler) setRetention(snapshots []Snapshot, epoch int) {
-	s.retentionMu.Lock()
-	defer s.retentionMu.Unlock()
-
-	s.retentionBuf = snapshots
-	s.retentionEpoch = epoch
-
-	// Cancel previous timer if still running
-	if s.retentionTimer != nil {
-		s.retentionTimer.Stop()
-	}
-
-	s.retentionTimer = time.AfterFunc(retentionDuration, func() {
-		s.retentionMu.Lock()
-		defer s.retentionMu.Unlock()
-		s.retentionBuf = nil
-		s.retentionEpoch = 0
-		log.Printf("[scheduler] retention buffer purged (90s expired)")
-	})
-}
-
 // sendReplay sends a "replay" message on live mode activation containing
-// the retained last batch (if within 90s) plus the current in-progress batch buffer.
+// the current in-progress batch buffer. This fills the gap between the last
+// R2-persisted batch and the start of live streaming.
 func (s *Scheduler) sendReplay() {
 	s.mu.RLock()
 	enc := s.encryptor
 	epoch := s.epoch
 	s.mu.RUnlock()
-
-	// Gather retained snapshots
-	s.retentionMu.Lock()
-	retained := s.retentionBuf
-	s.retentionMu.Unlock()
 
 	// Gather current batch buffer (don't drain — idle path still owns it)
 	s.batchMu.Lock()
@@ -436,16 +411,11 @@ func (s *Scheduler) sendReplay() {
 	copy(buffered, s.batchBuf)
 	s.batchMu.Unlock()
 
-	// Combine: retained first, then buffered
-	var combined []Snapshot
-	combined = append(combined, retained...)
-	combined = append(combined, buffered...)
-
-	if len(combined) == 0 {
+	if len(buffered) == 0 {
 		return
 	}
 
-	entries := s.encryptSnapshots(combined, enc, epoch)
+	entries := s.encryptSnapshots(buffered, enc, epoch)
 	if len(entries) == 0 {
 		return
 	}
@@ -457,8 +427,7 @@ func (s *Scheduler) sendReplay() {
 	}); err != nil {
 		log.Printf("[scheduler] replay send error: %v", err)
 	} else {
-		log.Printf("[scheduler] replay sent (%d entries: %d retained + %d buffered)",
-			len(entries), len(retained), len(buffered))
+		log.Printf("[scheduler] replay sent (%d buffered entries)", len(entries))
 	}
 }
 

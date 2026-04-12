@@ -278,35 +278,35 @@ func TestSendBatch_ProducesEncryptedEntries(t *testing.T) {
 		t.Fatalf("expected 2 batch entries, got %d", len(batchEntries))
 	}
 
-	// Decrypt each entry and verify content
+	// Decrypt each entry and verify content (now full Snapshot, not MetricPayload)
 	for i, be := range batchEntries {
 		plaintext, err := enc.Decrypt(be.EncPayload)
 		if err != nil {
 			t.Fatalf("decrypting entry %d: %v", i, err)
 		}
-		var mp MetricPayload
-		if err := json.Unmarshal(plaintext, &mp); err != nil {
+		var snap Snapshot
+		if err := json.Unmarshal(plaintext, &snap); err != nil {
 			t.Fatalf("unmarshaling entry %d: %v", i, err)
 		}
-		if mp.Timestamp != original[i].Timestamp {
-			t.Fatalf("entry %d: expected timestamp %d, got %d", i, original[i].Timestamp, mp.Timestamp)
+		if snap.Timestamp != original[i].Timestamp {
+			t.Fatalf("entry %d: expected timestamp %d, got %d", i, original[i].Timestamp, snap.Timestamp)
 		}
 	}
 
 	// Verify first entry
 	plain0, _ := enc.Decrypt(batchEntries[0].EncPayload)
-	var mp0 MetricPayload
-	json.Unmarshal(plain0, &mp0)
-	if mp0.Metrics[0].Name != "cpu" || mp0.Metrics[0].Value != 42.0 {
-		t.Fatalf("entry 0 mismatch: %+v", mp0)
+	var snap0 Snapshot
+	json.Unmarshal(plain0, &snap0)
+	if snap0.Metrics[0].Name != "cpu" || snap0.Metrics[0].Value != 42.0 {
+		t.Fatalf("entry 0 mismatch: %+v", snap0)
 	}
 
 	// Verify second entry
 	plain1, _ := enc.Decrypt(batchEntries[1].EncPayload)
-	var mp1 MetricPayload
-	json.Unmarshal(plain1, &mp1)
-	if mp1.Metrics[0].Name != "mem" || mp1.Metrics[0].Value != 80.5 {
-		t.Fatalf("entry 1 mismatch: %+v", mp1)
+	var snap1 Snapshot
+	json.Unmarshal(plain1, &snap1)
+	if snap1.Metrics[0].Name != "mem" || snap1.Metrics[0].Value != 80.5 {
+		t.Fatalf("entry 1 mismatch: %+v", snap1)
 	}
 }
 
@@ -340,7 +340,7 @@ func TestSendBatch_EncryptedPayloadDiffersFromPlaintext(t *testing.T) {
 		t.Fatalf("unmarshaling: %v", err)
 	}
 
-	plainJSON, _ := json.Marshal(MetricPayload{Timestamp: 999, Metrics: snap.Metrics})
+	plainJSON, _ := json.Marshal(Snapshot{Timestamp: 999, Metrics: snap.Metrics})
 	if batchEntries[0].EncPayload == string(plainJSON) {
 		t.Fatal("encrypted payload matches raw plaintext — encryption did not occur")
 	}
@@ -450,44 +450,44 @@ func TestMultipleBatches_SingleWALEntry(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Retention buffer
+// 7. Full Snapshot encryption (metrics + processes in batch)
 // ---------------------------------------------------------------------------
 
-func TestSetRetention_StoresSnapshots(t *testing.T) {
-	s := newTestScheduler(t)
-
-	snaps := []Snapshot{
-		{Timestamp: 1000, Metrics: []collector.Metric{{Name: "cpu", Value: 0.5}}},
-		{Timestamp: 1010, Metrics: []collector.Metric{{Name: "cpu", Value: 0.6}}},
+func TestSendBatch_IncludesProcesses(t *testing.T) {
+	enc, err := crypto.NewEncryptor()
+	if err != nil {
+		t.Fatalf("creating encryptor: %v", err)
 	}
 
-	s.setRetention(snaps, 1)
-
-	s.retentionMu.Lock()
-	count := len(s.retentionBuf)
-	epoch := s.retentionEpoch
-	s.retentionMu.Unlock()
-
-	if count != 2 {
-		t.Fatalf("expected 2 retained snapshots, got %d", count)
+	w, err := wal.New(t.TempDir(), 10, 100)
+	if err != nil {
+		t.Fatalf("creating WAL: %v", err)
 	}
-	if epoch != 1 {
-		t.Fatalf("expected retention epoch 1, got %d", epoch)
+
+	orch := collector.NewOrchestrator()
+	conn := transport.NewConnection("ws://invalid:0/ws", "", "test-agent", "test")
+	s := New("test-agent", 1, enc, orch, conn, w)
+
+	snap := &Snapshot{
+		Timestamp: 1000,
+		Metrics:   []collector.Metric{{Name: "cpu", Value: 0.5}},
+		Processes: []collector.ProcessSnapshot{{PID: 1, Name: "init", CPUPercent: 0.1}},
 	}
-}
-
-func TestSendBatch_SetsRetention(t *testing.T) {
-	s := newTestScheduler(t)
-
-	snap := &Snapshot{Timestamp: 1000, Metrics: []collector.Metric{{Name: "cpu", Value: 0.5}}}
 	s.bufferSnapshot(snap)
 	s.sendBatch()
 
-	s.retentionMu.Lock()
-	count := len(s.retentionBuf)
-	s.retentionMu.Unlock()
+	entries, _ := w.Pending()
+	var batchEntries []protocol.BatchEntry
+	json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries)
 
-	if count != 1 {
-		t.Fatalf("expected 1 retained snapshot after sendBatch, got %d", count)
+	plaintext, _ := enc.Decrypt(batchEntries[0].EncPayload)
+	var decrypted Snapshot
+	json.Unmarshal(plaintext, &decrypted)
+
+	if len(decrypted.Processes) != 1 {
+		t.Fatalf("expected 1 process in decrypted snapshot, got %d", len(decrypted.Processes))
+	}
+	if decrypted.Processes[0].Name != "init" {
+		t.Fatalf("expected process name 'init', got %s", decrypted.Processes[0].Name)
 	}
 }

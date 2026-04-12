@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	// MaxBatchSize is the max entries per log batch before flushing.
-	MaxBatchSize = 100
-	// FlushInterval is the max time between log batch flushes.
-	FlushInterval = 5 * time.Second
+	// MaxBatchSize is the memory-safety cap for log entries per batch.
+	// Triggers early flush on very chatty servers to prevent OOM.
+	MaxBatchSize = 50000
+	// batchInterval is the normal batch interval, wall-clock aligned like metrics.
+	logBatchInterval = 10 * time.Minute
 	// entryChannelSize is the buffer for the shared log entry channel.
 	entryChannelSize = 10000
 	// positionFlushInterval is how often positions are persisted to disk.
@@ -45,6 +46,14 @@ type Manager struct {
 	store   *PositionStore
 	entries chan LogEntry
 	flushCh chan struct{} // signal to flush partial batch immediately
+
+	// Live mode: when true, individual entries are also sent via SendLive.
+	liveMu sync.RWMutex
+	live   bool
+
+	// Batch buffer (protected by batchMu for BufferedEntries access)
+	batchMu sync.Mutex
+	batch   []LogEntry
 
 	// Active tailers keyed by source path/label
 	tailerMu sync.Mutex
@@ -82,12 +91,64 @@ func NewManager(
 }
 
 // FlushNow triggers an immediate flush of any buffered partial batch.
-// Called when dashboard connects (pace change to live) to avoid stale data.
 func (m *Manager) FlushNow() {
 	select {
 	case m.flushCh <- struct{}{}:
 	default:
 	}
+}
+
+// SetLive enables or disables live log forwarding.
+// When live, each incoming entry is also sent individually via SendLive.
+func (m *Manager) SetLive(live bool) {
+	m.liveMu.Lock()
+	defer m.liveMu.Unlock()
+	m.live = live
+	if live {
+		log.Printf("[logtail] live mode enabled")
+	} else {
+		log.Printf("[logtail] live mode disabled")
+	}
+}
+
+// BufferedEntries returns the current batch buffer as encrypted log entries
+// for replay on live mode activation. Does not drain the buffer.
+func (m *Manager) BufferedEntries() []protocol.LogBatchEntry {
+	m.mu.RLock()
+	enc := m.encryptor
+	epoch := m.epoch
+	_ = epoch
+	m.mu.RUnlock()
+
+	if enc == nil {
+		return nil
+	}
+
+	m.batchMu.Lock()
+	entries := make([]LogEntry, len(m.batch))
+	copy(entries, m.batch)
+	m.batchMu.Unlock()
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var result []protocol.LogBatchEntry
+	for _, entry := range entries {
+		plaintext, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		encrypted, err := enc.Encrypt(plaintext)
+		if err != nil {
+			continue
+		}
+		result = append(result, protocol.LogBatchEntry{
+			Timestamp:  entry.Timestamp,
+			EncPayload: encrypted,
+		})
+	}
+	return result
 }
 
 // SetEncryptor updates the encryptor and epoch (DEK rotation).
@@ -164,20 +225,35 @@ func (m *Manager) startTailer(key string, cfg LogSourceConfig) {
 	}
 }
 
+// timeUntilNextLogBatch returns the duration until the next clock-aligned 10-minute boundary.
+func timeUntilNextLogBatch() time.Duration {
+	now := time.Now()
+	next := now.Truncate(logBatchInterval).Add(logBatchInterval)
+	d := next.Sub(now)
+	if d <= 0 {
+		d = logBatchInterval
+	}
+	return d
+}
+
 // Run starts the batch sender loop. Blocks until ctx is cancelled.
+// Batches log entries for 10 minutes (wall-clock aligned, same as metrics).
 func (m *Manager) Run(ctx context.Context) {
-	flushTicker := time.NewTicker(FlushInterval)
-	defer flushTicker.Stop()
+	// Wall-clock-aligned batch timer
+	batchTimer := time.NewTimer(timeUntilNextLogBatch())
+	defer batchTimer.Stop()
 
 	posTicker := time.NewTicker(positionFlushInterval)
 	defer posTicker.Stop()
-
-	var batch []LogEntry
 
 	for {
 		select {
 		case <-ctx.Done():
 			// Flush remaining entries
+			m.batchMu.Lock()
+			batch := m.batch
+			m.batch = nil
+			m.batchMu.Unlock()
 			if len(batch) > 0 {
 				m.sendBatch(batch)
 			}
@@ -186,22 +262,47 @@ func (m *Manager) Run(ctx context.Context) {
 			return
 
 		case entry := <-m.entries:
-			batch = append(batch, entry)
-			if len(batch) >= MaxBatchSize {
-				m.sendBatch(batch)
-				batch = nil
+			// Buffer the entry
+			m.batchMu.Lock()
+			m.batch = append(m.batch, entry)
+			batchLen := len(m.batch)
+			m.batchMu.Unlock()
+
+			// Also send live if viewer is connected
+			m.liveMu.RLock()
+			isLive := m.live
+			m.liveMu.RUnlock()
+			if isLive {
+				m.SendLive(entry)
 			}
 
-		case <-flushTicker.C:
+			// Memory safety: early flush if batch is huge
+			if batchLen >= MaxBatchSize {
+				m.batchMu.Lock()
+				batch := m.batch
+				m.batch = nil
+				m.batchMu.Unlock()
+				m.sendBatch(batch)
+			}
+
+		case <-batchTimer.C:
+			// 10-minute wall-clock boundary: flush batch
+			m.batchMu.Lock()
+			batch := m.batch
+			m.batch = nil
+			m.batchMu.Unlock()
 			if len(batch) > 0 {
 				m.sendBatch(batch)
-				batch = nil
 			}
+			batchTimer.Reset(timeUntilNextLogBatch())
 
 		case <-m.flushCh:
+			m.batchMu.Lock()
+			batch := m.batch
+			m.batch = nil
+			m.batchMu.Unlock()
 			if len(batch) > 0 {
 				m.sendBatch(batch)
-				batch = nil
 			}
 
 		case <-posTicker.C:
