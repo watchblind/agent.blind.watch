@@ -34,9 +34,9 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-info()  { echo -e "${BLUE}[info]${NC}  $*"; }
-ok()    { echo -e "${GREEN}[ok]${NC}    $*"; }
-warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
+info()  { echo -e "${BLUE}[info]${NC}  $*" >&2; }
+ok()    { echo -e "${GREEN}[ok]${NC}    $*" >&2; }
+warn()  { echo -e "${YELLOW}[warn]${NC}  $*" >&2; }
 error() { echo -e "${RED}[error]${NC} $*" >&2; }
 fatal() { error "$*"; exit 1; }
 
