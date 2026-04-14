@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func makeEntry(batchID string, ts int64) Entry {
@@ -40,17 +41,8 @@ func TestNew_CreatesDirectory(t *testing.T) {
 }
 
 func TestNew_DefaultLimits(t *testing.T) {
-	dir := t.TempDir()
-	w, err := New(dir, 0, 0)
-	if err != nil {
-		t.Fatalf("New() error: %v", err)
-	}
-	if w.maxSizeMB != 500 {
-		t.Errorf("maxSizeMB = %d, want 500", w.maxSizeMB)
-	}
-	if w.maxEntries != 1000 {
-		t.Errorf("maxEntries = %d, want 1000", w.maxEntries)
-	}
+	// Superseded by TestNew_NewDefaults — kept as a no-op to preserve function name.
+	_ = t
 }
 
 func TestAppendAndPending(t *testing.T) {
@@ -487,5 +479,67 @@ func TestConcurrentAppendAndAck(t *testing.T) {
 
 	if len(pending) != 50 {
 		t.Errorf("Pending() = %d entries, want 50 new entries", len(pending))
+	}
+}
+
+func TestNew_NewDefaults(t *testing.T) {
+	w, err := New(t.TempDir(), 0, 0)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if w.maxSizeMB != 1024 {
+		t.Errorf("maxSizeMB = %d, want 1024", w.maxSizeMB)
+	}
+	if w.maxEntries != 2000 {
+		t.Errorf("maxEntries = %d, want 2000", w.maxEntries)
+	}
+	if w.maxAge != 7*24*time.Hour {
+		t.Errorf("maxAge = %v, want 7d", w.maxAge)
+	}
+}
+
+func TestEnforceTTL_DropsOldFiles(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, 10, 100)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := w.Append(makeEntry("old", 100)); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	old := filepath.Join(dir, "old.wal")
+	past := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	if err := w.Append(makeEntry("fresh", 200)); err != nil {
+		t.Fatalf("Append fresh: %v", err)
+	}
+	pending, err := w.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if len(pending) != 1 || pending[0].BatchID != "fresh" {
+		t.Errorf("pending = %+v, want only [fresh]", pending)
+	}
+}
+
+func TestAppend_AtomicWrite_NoStrayTemp(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, 10, 100)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := w.Append(makeEntry("b", 100)); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".wal") {
+			t.Errorf("stray file in WAL dir: %s", e.Name())
+		}
 	}
 }

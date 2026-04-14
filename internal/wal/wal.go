@@ -8,120 +8,105 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
-// Entry represents a single WAL entry stored as an encrypted file on disk.
-// Only encrypted data is persisted — plaintext never touches disk.
+// Entry represents a single finalized batch stored as a JSON file on disk.
+// Used by logtail and the legacy single-file batch path. Scheduler now uses
+// OpenBatch for incremental writes; both produce *.wal files that drain
+// through the same Pending/Ack lifecycle.
 type Entry struct {
 	BatchID    string `json:"batch_id"`
 	AgentID    string `json:"agent_id"`
 	Epoch      int    `json:"epoch"`
 	Timestamp  int64  `json:"timestamp"`
-	EncPayload string `json:"enc_payload"` // base64 AES-256-GCM ciphertext
+	EncPayload string `json:"enc_payload"`
 }
 
-// WAL implements an append-only write-ahead log backed by individual files.
-// Each batch window gets its own file named by timestamp.
-// Files are deleted only after the server acknowledges receipt.
+// Default limits. See design doc 2026-04-14-agent-reconnection-and-crash-safe-buffering-design.md §4.5.
+const (
+	defaultMaxSizeMB  = 1024
+	defaultMaxEntries = 2000
+	defaultMaxAge     = 7 * 24 * time.Hour
+)
+
+// WAL is a directory of *.wal files plus, when scheduler is using OpenBatch,
+// transient *.open files. Only *.wal files are exposed via Pending().
 type WAL struct {
 	dir        string
 	maxSizeMB  int
 	maxEntries int
+	maxAge     time.Duration
 
 	mu sync.Mutex
 }
 
-// New creates a WAL in the given directory.
+// New creates a WAL in the given directory with the given limits. Pass 0 for
+// either limit to use the package defaults (1024 MB, 2000 files).
 func New(dir string, maxSizeMB, maxEntries int) (*WAL, error) {
 	if maxSizeMB <= 0 {
-		maxSizeMB = 500
+		maxSizeMB = defaultMaxSizeMB
 	}
 	if maxEntries <= 0 {
-		maxEntries = 1000
+		maxEntries = defaultMaxEntries
 	}
-
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating WAL directory: %w", err)
 	}
-
 	return &WAL{
 		dir:        dir,
 		maxSizeMB:  maxSizeMB,
 		maxEntries: maxEntries,
+		maxAge:     defaultMaxAge,
 	}, nil
 }
 
-// Append writes an encrypted entry to disk. The entry must already be encrypted
-// before calling this method — WAL never sees plaintext.
+// Dir returns the WAL directory path.
+func (w *WAL) Dir() string { return w.dir }
+
+// Append writes a finalized Entry to disk atomically (temp + rename + dir
+// fsync). Used by logtail and the legacy single-file batch path.
 func (w *WAL) Append(entry Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Enforce entry limit — drop oldest if at capacity
-	entries, _ := w.listFilesLocked()
-	if len(entries) >= w.maxEntries {
-		// Drop oldest
-		oldest := entries[0]
-		os.Remove(oldest)
-		entries = entries[1:]
-	}
-
-	// Enforce size limit
-	w.enforceSize()
+	w.enforceLimitsLocked()
 
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("marshaling WAL entry: %w", err)
 	}
 
-	// Sanitize batch_id: use only the base name to prevent path traversal
 	safeName := filepath.Base(entry.BatchID)
 	if safeName == "." || safeName == "/" || safeName == "" {
 		return fmt.Errorf("invalid batch_id: %q", entry.BatchID)
 	}
-	filename := fmt.Sprintf("%s.wal", safeName)
-	path := filepath.Join(w.dir, filename)
-
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("writing WAL file: %w", err)
-	}
-
-	// fsync the file for crash safety
-	f, err := os.Open(path)
-	if err == nil {
-		f.Sync()
-		f.Close()
-	}
-
-	return nil
+	path := filepath.Join(w.dir, safeName+".wal")
+	return atomicReplace(path, data, 0600)
 }
 
-// Ack deletes the WAL entry for the given batch ID.
-// Called when the server acknowledges receipt.
+// Ack deletes the WAL entry for the given batch ID. Idempotent — missing files
+// are not an error.
 func (w *WAL) Ack(batchID string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	safeName := filepath.Base(batchID)
-	filename := fmt.Sprintf("%s.wal", safeName)
-	path := filepath.Join(w.dir, filename)
-
+	path := filepath.Join(w.dir, safeName+".wal")
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("removing WAL entry: %w", err)
 	}
-	return nil
+	return fsyncDir(w.dir)
 }
 
-// Pending returns all unacknowledged WAL entries, sorted by timestamp.
+// Pending returns all unacknowledged finalized (.wal) entries, sorted by
+// timestamp. *.open files are not included.
 func (w *WAL) Pending() ([]Entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	files, err := w.listFilesLocked()
+	files, err := w.listWALFilesLocked()
 	if err != nil {
 		return nil, err
 	}
-
 	var entries []Entry
 	for _, path := range files {
 		data, err := os.ReadFile(path)
@@ -134,33 +119,39 @@ func (w *WAL) Pending() ([]Entry, error) {
 		}
 		entries = append(entries, entry)
 	}
-
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Timestamp < entries[j].Timestamp
 	})
-
 	return entries, nil
 }
 
-// Count returns the number of pending entries.
+// Count returns the number of pending finalized (.wal) entries.
 func (w *WAL) Count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	files, _ := w.listFilesLocked()
+	files, _ := w.listWALFilesLocked()
 	return len(files)
 }
 
-// Dir returns the WAL directory path.
-func (w *WAL) Dir() string {
-	return w.dir
+// PendingBytes returns the total on-disk size of pending finalized entries.
+func (w *WAL) PendingBytes() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	files, _ := w.listWALFilesLocked()
+	var total int64
+	for _, f := range files {
+		if info, err := os.Stat(f); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
 }
 
-func (w *WAL) listFilesLocked() ([]string, error) {
+func (w *WAL) listWALFilesLocked() ([]string, error) {
 	dirEntries, err := os.ReadDir(w.dir)
 	if err != nil {
 		return nil, fmt.Errorf("reading WAL directory: %w", err)
 	}
-
 	var files []string
 	for _, e := range dirEntries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".wal") {
@@ -171,25 +162,41 @@ func (w *WAL) listFilesLocked() ([]string, error) {
 	return files, nil
 }
 
-func (w *WAL) enforceSize() {
-	files, err := w.listFilesLocked()
-	if err != nil || len(files) == 0 {
-		return
-	}
+// enforceLimitsLocked applies (in order) the TTL, the max-entries, and the
+// max-size policies. Caller must hold w.mu.
+func (w *WAL) enforceLimitsLocked() {
+	files, _ := w.listWALFilesLocked()
 
-	var totalSize int64
+	// 1. TTL — drop anything older than maxAge by mtime.
+	cutoff := time.Now().Add(-w.maxAge)
+	kept := files[:0]
 	for _, f := range files {
 		info, err := os.Stat(f)
-		if err == nil {
-			totalSize += info.Size()
+		if err == nil && info.ModTime().Before(cutoff) {
+			os.Remove(f)
+			continue
 		}
+		kept = append(kept, f)
+	}
+	files = kept
+
+	// 2. Max entries — drop oldest first.
+	for len(files) >= w.maxEntries && len(files) > 0 {
+		os.Remove(files[0])
+		files = files[1:]
 	}
 
+	// 3. Max bytes — drop oldest first until under cap.
 	maxBytes := int64(w.maxSizeMB) * 1024 * 1024
-	for totalSize > maxBytes && len(files) > 0 {
-		info, err := os.Stat(files[0])
-		if err == nil {
-			totalSize -= info.Size()
+	var total int64
+	for _, f := range files {
+		if info, err := os.Stat(f); err == nil {
+			total += info.Size()
+		}
+	}
+	for total > maxBytes && len(files) > 0 {
+		if info, err := os.Stat(files[0]); err == nil {
+			total -= info.Size()
 		}
 		os.Remove(files[0])
 		files = files[1:]
