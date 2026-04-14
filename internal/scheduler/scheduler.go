@@ -1,10 +1,13 @@
 package scheduler
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -60,9 +63,10 @@ type Scheduler struct {
 	mu   sync.RWMutex
 	mode Mode
 
-	// Buffer for accumulating snapshots between batch sends (idle path).
-	batchMu  sync.Mutex
-	batchBuf []Snapshot
+	// In-progress batch, opened lazily on first idle-tick collect of a window.
+	openMu    sync.Mutex
+	openBatch *wal.OpenBatch
+	openID    string
 
 	// Channel to signal pace changes to the run loop.
 	paceChanged chan struct{}
@@ -160,6 +164,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 // syncWAL resends pending WAL batches on startup. Each WAL file is a full
 // batch (entries array) that can be resent as a single wal_sync message.
 func (s *Scheduler) syncWAL() {
+	if err := s.wal.RecoverOrphans(); err != nil {
+		log.Printf("[scheduler] WAL recovery error: %v", err)
+	}
+
 	entries, err := s.wal.Pending()
 	if err != nil {
 		log.Printf("[scheduler] WAL read error: %v", err)
@@ -313,122 +321,140 @@ func (s *Scheduler) collect(ctx context.Context) *Snapshot {
 }
 
 func (s *Scheduler) bufferSnapshot(snap *Snapshot) {
-	s.batchMu.Lock()
-	defer s.batchMu.Unlock()
-	s.batchBuf = append(s.batchBuf, *snap)
-}
-
-// sendBatch encrypts all buffered snapshots individually, writes to WAL as
-// one entry, and sends ONE "batch" message with all entries.
-func (s *Scheduler) sendBatch() {
-	s.batchMu.Lock()
-	snapshots := s.batchBuf
-	s.batchBuf = nil
-	s.batchMu.Unlock()
-
-	if len(snapshots) == 0 {
-		return
-	}
-
 	s.mu.RLock()
 	enc := s.encryptor
 	epoch := s.epoch
 	s.mu.RUnlock()
 
-	batchID := fmt.Sprintf("b_%d_%s", time.Now().Unix(), s.agentID)
-
-	entries := s.encryptSnapshots(snapshots, enc, epoch)
-	if len(entries) == 0 {
-		return
-	}
-
-	// Serialize entries for WAL storage
-	walPayload, err := json.Marshal(entries)
+	plaintext, err := json.Marshal(snap)
 	if err != nil {
-		log.Printf("[scheduler] marshal WAL entries error: %v", err)
+		log.Printf("[scheduler] marshal snapshot error: %v", err)
+		return
+	}
+	encrypted, err := enc.Encrypt(plaintext)
+	if err != nil {
+		log.Printf("[scheduler] encrypt snapshot error: %v", err)
 		return
 	}
 
-	// WAL: persist full batch before sending
-	if err := s.wal.Append(wal.Entry{
-		BatchID:    batchID,
-		AgentID:    s.agentID,
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+
+	if s.openBatch == nil {
+		batchID := fmt.Sprintf("b_%d_%s", time.Now().Unix(), s.agentID)
+		ob, err := s.wal.OpenBatch(wal.BatchMeta{
+			BatchID:   batchID,
+			AgentID:   s.agentID,
+			Epoch:     epoch,
+			StartedAt: snap.Timestamp,
+		})
+		if err != nil {
+			log.Printf("[scheduler] OpenBatch error: %v", err)
+			return
+		}
+		s.openBatch = ob
+		s.openID = batchID
+	}
+
+	if err := s.openBatch.Append(wal.EntryRecord{
 		Epoch:      epoch,
-		Timestamp:  snapshots[0].Timestamp,
-		EncPayload: string(walPayload),
+		Timestamp:  snap.Timestamp,
+		EncPayload: encrypted,
 	}); err != nil {
-		log.Printf("[scheduler] WAL append error: %v", err)
+		log.Printf("[scheduler] OpenBatch.Append error: %v", err)
+	}
+}
+
+// sendBatch finalizes the in-progress OpenBatch and sends ONE "batch" message
+// with all entries.
+func (s *Scheduler) sendBatch() {
+	s.openMu.Lock()
+	ob := s.openBatch
+	s.openBatch = nil
+	s.openID = ""
+	s.openMu.Unlock()
+
+	if ob == nil {
+		return
+	}
+
+	entry, err := ob.Finalize()
+	if err == wal.ErrEmptyBatch {
+		return
+	}
+	if err != nil {
+		log.Printf("[scheduler] Finalize error: %v", err)
+		return
+	}
+
+	var payloads []string
+	if err := json.Unmarshal([]byte(entry.EncPayload), &payloads); err != nil {
+		log.Printf("[scheduler] decode payloads error: %v", err)
+		return
+	}
+	entries := make([]protocol.BatchEntry, len(payloads))
+	for i, p := range payloads {
+		entries[i] = protocol.BatchEntry{
+			Epoch:      entry.Epoch,
+			Timestamp:  entry.Timestamp + int64(i*10),
+			EncPayload: p,
+		}
 	}
 
 	if err := s.conn.Send(protocol.BatchMessage{
 		Type:    "batch",
-		BatchID: batchID,
-		Epoch:   epoch,
+		BatchID: entry.BatchID,
+		Epoch:   entry.Epoch,
 		Entries: entries,
 	}); err != nil {
 		log.Printf("[scheduler] batch send error: %v (data in WAL)", err)
 	} else {
-		log.Printf("[scheduler] batch sent: %s (%d entries)", batchID, len(entries))
+		log.Printf("[scheduler] batch sent: %s (%d entries)", entry.BatchID, len(entries))
 	}
-}
-
-// encryptSnapshots encrypts each full Snapshot (metrics + processes) individually.
-// R2 has no size limit, so we store the complete snapshot for full-resolution history.
-func (s *Scheduler) encryptSnapshots(snapshots []Snapshot, enc *crypto.Encryptor, epoch int) []protocol.BatchEntry {
-	var entries []protocol.BatchEntry
-	for _, snap := range snapshots {
-		plaintext, err := json.Marshal(snap)
-		if err != nil {
-			log.Printf("[scheduler] marshal snapshot error: %v", err)
-			continue
-		}
-		encrypted, err := enc.Encrypt(plaintext)
-		if err != nil {
-			log.Printf("[scheduler] encrypt snapshot error: %v", err)
-			continue
-		}
-		entries = append(entries, protocol.BatchEntry{
-			Epoch:      epoch,
-			Timestamp:  snap.Timestamp,
-			EncPayload: encrypted,
-		})
-	}
-	return entries
 }
 
 // sendReplay sends a "replay" message on live mode activation containing
-// the current in-progress batch buffer. This fills the gap between the last
-// R2-persisted batch and the start of live streaming.
+// the current in-progress batch data from the .open file on disk.
+// This fills the gap between the last R2-persisted batch and the start of live streaming.
 func (s *Scheduler) sendReplay() {
-	s.mu.RLock()
-	enc := s.encryptor
-	epoch := s.epoch
-	s.mu.RUnlock()
-
-	// Gather current batch buffer (don't drain — idle path still owns it)
-	s.batchMu.Lock()
-	buffered := make([]Snapshot, len(s.batchBuf))
-	copy(buffered, s.batchBuf)
-	s.batchMu.Unlock()
-
-	if len(buffered) == 0 {
+	s.openMu.Lock()
+	ob := s.openBatch
+	openID := s.openID
+	s.openMu.Unlock()
+	if ob == nil {
 		return
 	}
+	path := filepath.Join(s.wal.Dir(), openID+".open")
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
 
-	entries := s.encryptSnapshots(buffered, enc, epoch)
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	first := true
+	var entries []protocol.BatchEntry
+	for scanner.Scan() {
+		if first {
+			first = false
+			continue
+		}
+		var rec wal.EntryRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			break
+		}
+		entries = append(entries, protocol.BatchEntry{
+			Epoch: rec.Epoch, Timestamp: rec.Timestamp, EncPayload: rec.EncPayload,
+		})
+	}
 	if len(entries) == 0 {
 		return
 	}
-
-	if err := s.conn.Send(protocol.ReplayMessage{
-		Type:    "replay",
-		Epoch:   epoch,
-		Entries: entries,
-	}); err != nil {
-		log.Printf("[scheduler] replay send error: %v", err)
-	} else {
-		log.Printf("[scheduler] replay sent (%d buffered entries)", len(entries))
-	}
+	s.mu.RLock()
+	epoch := s.epoch
+	s.mu.RUnlock()
+	s.conn.Send(protocol.ReplayMessage{Type: "replay", Epoch: epoch, Entries: entries})
 }
 
 func (s *Scheduler) sendLive(snap *Snapshot) {
@@ -455,59 +481,44 @@ func (s *Scheduler) sendLive(snap *Snapshot) {
 	})
 }
 
-// flush encrypts and sends any buffered data. Called on graceful shutdown.
-// Uses SendSync for each message since the process is shutting down.
-// Sends ONE message with all entries (same format as batch).
+// flush finalizes the in-progress OpenBatch and sends a flush message.
+// Called on graceful shutdown. Uses SendSync since the process is shutting down.
 func (s *Scheduler) flush() {
-	s.batchMu.Lock()
-	snapshots := s.batchBuf
-	s.batchBuf = nil
-	s.batchMu.Unlock()
+	s.openMu.Lock()
+	ob := s.openBatch
+	s.openBatch = nil
+	s.openID = ""
+	s.openMu.Unlock()
 
-	if len(snapshots) == 0 {
+	if ob == nil {
 		return
 	}
 
-	s.mu.RLock()
-	enc := s.encryptor
-	epoch := s.epoch
-	s.mu.RUnlock()
-
-	batchID := fmt.Sprintf("flush_%d_%s", time.Now().Unix(), s.agentID)
-
-	entries := s.encryptSnapshots(snapshots, enc, epoch)
-	if len(entries) == 0 {
+	entry, err := ob.Finalize()
+	if err == wal.ErrEmptyBatch {
 		return
 	}
-
-	// Serialize entries for WAL storage
-	walPayload, err := json.Marshal(entries)
 	if err != nil {
-		log.Printf("[scheduler] marshal WAL entries error: %v", err)
+		log.Printf("[scheduler] flush finalize error: %v", err)
 		return
 	}
 
-	// WAL: persist before sending
-	if err := s.wal.Append(wal.Entry{
-		BatchID:    batchID,
-		AgentID:    s.agentID,
-		Epoch:      epoch,
-		Timestamp:  snapshots[0].Timestamp,
-		EncPayload: string(walPayload),
-	}); err != nil {
-		log.Printf("[scheduler] WAL flush append error: %v", err)
+	var payloads []string
+	_ = json.Unmarshal([]byte(entry.EncPayload), &payloads)
+	entries := make([]protocol.BatchEntry, len(payloads))
+	for i, p := range payloads {
+		entries[i] = protocol.BatchEntry{
+			Epoch: entry.Epoch, Timestamp: entry.Timestamp + int64(i*10), EncPayload: p,
+		}
 	}
 
 	if err := s.conn.SendSync(protocol.FlushMessage{
 		Type:    "flush",
-		BatchID: batchID,
-		Epoch:   epoch,
+		BatchID: entry.BatchID,
+		Epoch:   entry.Epoch,
 		Entries: entries,
 	}); err != nil {
 		log.Printf("[scheduler] flush send error: %v (data in WAL)", err)
-	} else {
-		log.Printf("[scheduler] flush sent: %s (%d entries from %d buffered)",
-			batchID, len(entries), len(snapshots))
 	}
 }
 

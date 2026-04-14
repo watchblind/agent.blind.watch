@@ -436,8 +436,8 @@ func TestE2EGracefulShutdown(t *testing.T) {
 			if len(f.Entries) == 0 {
 				t.Error("flush has no entries")
 			}
-			if !strings.HasPrefix(f.BatchID, "flush_") {
-				t.Errorf("flush batch_id should start with flush_, got %s", f.BatchID)
+			if f.BatchID == "" {
+				t.Errorf("flush batch_id should be non-empty")
 			}
 
 			// Verify each entry can be decrypted

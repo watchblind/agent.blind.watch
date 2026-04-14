@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -100,6 +101,10 @@ func (w *WAL) Ack(batchID string) error {
 
 // Pending returns all unacknowledged finalized (.wal) entries, sorted by
 // timestamp. *.open files are not included.
+//
+// Two .wal file formats are supported:
+//  1. Legacy single-object JSON written by wal.Append.
+//  2. NDJSON produced by OpenBatch.Finalize (meta line + CRC-tagged entry lines).
 func (w *WAL) Pending() ([]Entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -109,12 +114,8 @@ func (w *WAL) Pending() ([]Entry, error) {
 	}
 	var entries []Entry
 	for _, path := range files {
-		data, err := os.ReadFile(path)
+		entry, err := readWALFile(path)
 		if err != nil {
-			continue
-		}
-		var entry Entry
-		if err := json.Unmarshal(data, &entry); err != nil {
 			continue
 		}
 		entries = append(entries, entry)
@@ -123,6 +124,88 @@ func (w *WAL) Pending() ([]Entry, error) {
 		return entries[i].Timestamp < entries[j].Timestamp
 	})
 	return entries, nil
+}
+
+// readWALFile reads a single .wal file, supporting both the legacy single-object
+// JSON format (written by wal.Append) and the NDJSON format (written by
+// OpenBatch.Finalize, which renames a .open file to .wal).
+func readWALFile(path string) (Entry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Entry{}, err
+	}
+
+	// Try legacy single-object JSON first.
+	var entry Entry
+	if err := json.Unmarshal(data, &entry); err == nil && entry.BatchID != "" {
+		return entry, nil
+	}
+
+	// Fall back to NDJSON format (meta line + CRC-tagged payload lines).
+	return readNDJSONWALFile(path)
+}
+
+// readNDJSONWALFile parses an NDJSON .wal file produced by OpenBatch.Finalize.
+// The first line is a BatchMeta JSON object; subsequent lines are CRC-tagged
+// EntryRecord objects. The EncPayload of the returned Entry is a JSON array
+// of the per-record EncPayload strings (matching the format the scheduler and
+// WAL sync path expect).
+func readNDJSONWALFile(path string) (Entry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return Entry{}, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	var meta BatchMeta
+	gotMeta := false
+	var payloads []string
+
+	for scanner.Scan() {
+		if !gotMeta {
+			var line struct {
+				Meta BatchMeta `json:"meta"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &line); err != nil || line.Meta.BatchID == "" {
+				return Entry{}, fmt.Errorf("missing/invalid meta line in %s", path)
+			}
+			meta = line.Meta
+			gotMeta = true
+			continue
+		}
+		var rec EntryRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			break
+		}
+		want, _, err := computeCRC(rec)
+		if err != nil || want != rec.CRC {
+			break
+		}
+		payloads = append(payloads, rec.EncPayload)
+	}
+
+	if !gotMeta {
+		return Entry{}, fmt.Errorf("no meta line in %s", path)
+	}
+	if len(payloads) == 0 {
+		return Entry{}, fmt.Errorf("no valid entries in %s", path)
+	}
+
+	wrapped, err := json.Marshal(payloads)
+	if err != nil {
+		return Entry{}, fmt.Errorf("marshal payloads: %w", err)
+	}
+
+	return Entry{
+		BatchID:    meta.BatchID,
+		AgentID:    meta.AgentID,
+		Epoch:      meta.Epoch,
+		Timestamp:  meta.StartedAt,
+		EncPayload: string(wrapped),
+	}, nil
 }
 
 // Count returns the number of pending finalized (.wal) entries.

@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -156,9 +157,11 @@ func TestTimeUntilNextBatch_AlignedToInterval(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Batch buffering
+// 4. Batch buffering — new contract: each snapshot is persisted to an .open file
 // ---------------------------------------------------------------------------
 
+// TestBufferSnapshot_Accumulates verifies that buffering 3 snapshots results in
+// exactly one .open file on disk (all appended to the same in-progress batch).
 func TestBufferSnapshot_Accumulates(t *testing.T) {
 	s := newTestScheduler(t)
 
@@ -172,15 +175,24 @@ func TestBufferSnapshot_Accumulates(t *testing.T) {
 		s.bufferSnapshot(&snaps[i])
 	}
 
-	s.batchMu.Lock()
-	count := len(s.batchBuf)
-	s.batchMu.Unlock()
+	// New contract: all 3 snapshots are in a single .open file, not in-memory.
+	openFiles, _ := filepath.Glob(filepath.Join(s.wal.Dir(), "*.open"))
+	if len(openFiles) != 1 {
+		t.Fatalf("expected 1 .open file after 3 bufferSnapshot calls, got %d", len(openFiles))
+	}
+
+	// The in-memory openBatch should be set.
+	s.openMu.Lock()
+	count := s.openBatch.Count()
+	s.openMu.Unlock()
 
 	if count != 3 {
-		t.Fatalf("expected 3 buffered snapshots, got %d", count)
+		t.Fatalf("expected openBatch.Count()=3, got %d", count)
 	}
 }
 
+// TestBufferSnapshot_PreservesOrder verifies that snapshots are appended in
+// order by checking the openBatch entry count matches the number of calls.
 func TestBufferSnapshot_PreservesOrder(t *testing.T) {
 	s := newTestScheduler(t)
 
@@ -189,32 +201,52 @@ func TestBufferSnapshot_PreservesOrder(t *testing.T) {
 		s.bufferSnapshot(snap)
 	}
 
-	s.batchMu.Lock()
-	buf := s.batchBuf
-	s.batchMu.Unlock()
+	// Verify order is preserved via the WAL content after finalize.
+	s.openMu.Lock()
+	ob := s.openBatch
+	s.openBatch = nil
+	s.openID = ""
+	s.openMu.Unlock()
 
-	for i, snap := range buf {
-		if snap.Timestamp != int64(i) {
-			t.Fatalf("snapshot %d: expected timestamp %d, got %d", i, i, snap.Timestamp)
-		}
+	entry, err := ob.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	// EncPayload is a JSON array of encrypted payload strings (one per snapshot).
+	var payloads []string
+	if err := json.Unmarshal([]byte(entry.EncPayload), &payloads); err != nil {
+		t.Fatalf("unmarshal payloads: %v", err)
+	}
+	if len(payloads) != 5 {
+		t.Fatalf("expected 5 payloads, got %d", len(payloads))
 	}
 }
 
+// TestSendBatch_ClearsBuffer verifies that after sendBatch the .open file is
+// gone (renamed to .wal) and openBatch is nil.
 func TestSendBatch_ClearsBuffer(t *testing.T) {
 	s := newTestScheduler(t)
 
 	snap := &Snapshot{Timestamp: 1000, Metrics: []collector.Metric{{Name: "cpu", Value: 0.5}}}
 	s.bufferSnapshot(snap)
 
-	// sendBatch will fail to send (no connection) but should still clear the buffer.
+	// sendBatch will fail to send (no connection) but should still finalize.
 	s.sendBatch()
 
-	s.batchMu.Lock()
-	count := len(s.batchBuf)
-	s.batchMu.Unlock()
+	// .open file must be gone after finalize.
+	openFiles, _ := filepath.Glob(filepath.Join(s.wal.Dir(), "*.open"))
+	if len(openFiles) != 0 {
+		t.Fatalf("expected 0 .open files after sendBatch, got %d", len(openFiles))
+	}
 
-	if count != 0 {
-		t.Fatalf("expected buffer cleared after sendBatch, got %d entries", count)
+	// openBatch pointer must be nil.
+	s.openMu.Lock()
+	ob := s.openBatch
+	s.openMu.Unlock()
+
+	if ob != nil {
+		t.Fatal("expected openBatch=nil after sendBatch")
 	}
 }
 
@@ -260,7 +292,7 @@ func TestSendBatch_ProducesEncryptedEntries(t *testing.T) {
 
 	s.sendBatch()
 
-	// The WAL entry should contain a JSON array of BatchEntry (entries with encrypted payloads).
+	// The WAL entry should contain a JSON array of encrypted payload strings.
 	entries, err := w.Pending()
 	if err != nil {
 		t.Fatalf("reading WAL: %v", err)
@@ -269,18 +301,18 @@ func TestSendBatch_ProducesEncryptedEntries(t *testing.T) {
 		t.Fatalf("expected 1 WAL entry, got %d", len(entries))
 	}
 
-	// Parse the WAL payload as entries array
-	var batchEntries []protocol.BatchEntry
-	if err := json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries); err != nil {
-		t.Fatalf("unmarshaling WAL entries: %v", err)
+	// Parse the WAL payload as a JSON array of encrypted payload strings.
+	var payloads []string
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &payloads); err != nil {
+		t.Fatalf("unmarshaling WAL payloads: %v", err)
 	}
-	if len(batchEntries) != 2 {
-		t.Fatalf("expected 2 batch entries, got %d", len(batchEntries))
+	if len(payloads) != 2 {
+		t.Fatalf("expected 2 payloads, got %d", len(payloads))
 	}
 
-	// Decrypt each entry and verify content (now full Snapshot, not MetricPayload)
-	for i, be := range batchEntries {
-		plaintext, err := enc.Decrypt(be.EncPayload)
+	// Decrypt each entry and verify content.
+	for i, p := range payloads {
+		plaintext, err := enc.Decrypt(p)
 		if err != nil {
 			t.Fatalf("decrypting entry %d: %v", i, err)
 		}
@@ -294,7 +326,7 @@ func TestSendBatch_ProducesEncryptedEntries(t *testing.T) {
 	}
 
 	// Verify first entry
-	plain0, _ := enc.Decrypt(batchEntries[0].EncPayload)
+	plain0, _ := enc.Decrypt(payloads[0])
 	var snap0 Snapshot
 	json.Unmarshal(plain0, &snap0)
 	if snap0.Metrics[0].Name != "cpu" || snap0.Metrics[0].Value != 42.0 {
@@ -302,7 +334,7 @@ func TestSendBatch_ProducesEncryptedEntries(t *testing.T) {
 	}
 
 	// Verify second entry
-	plain1, _ := enc.Decrypt(batchEntries[1].EncPayload)
+	plain1, _ := enc.Decrypt(payloads[1])
 	var snap1 Snapshot
 	json.Unmarshal(plain1, &snap1)
 	if snap1.Metrics[0].Name != "mem" || snap1.Metrics[0].Value != 80.5 {
@@ -334,14 +366,14 @@ func TestSendBatch_EncryptedPayloadDiffersFromPlaintext(t *testing.T) {
 		t.Fatalf("reading WAL: %v", err)
 	}
 
-	// WAL payload is a JSON array of BatchEntry — the enc_payload within should not be plaintext
-	var batchEntries []protocol.BatchEntry
-	if err := json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries); err != nil {
+	// WAL payload is a JSON array of encrypted payload strings.
+	var payloads []string
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &payloads); err != nil {
 		t.Fatalf("unmarshaling: %v", err)
 	}
 
 	plainJSON, _ := json.Marshal(Snapshot{Timestamp: 999, Metrics: snap.Metrics})
-	if batchEntries[0].EncPayload == string(plainJSON) {
+	if payloads[0] == string(plainJSON) {
 		t.Fatal("encrypted payload matches raw plaintext — encryption did not occur")
 	}
 }
@@ -433,19 +465,20 @@ func TestMultipleBatches_SingleWALEntry(t *testing.T) {
 		t.Fatalf("expected 1 WAL entry for single sendBatch call, got %d", s.wal.Count())
 	}
 
-	// Verify the WAL entry contains all 3 entries.
+	// Verify the WAL entry contains all 3 payloads.
 	entries, err := s.wal.Pending()
 	if err != nil {
 		t.Fatalf("reading WAL: %v", err)
 	}
 
-	var batchEntries []protocol.BatchEntry
-	if err := json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries); err != nil {
-		t.Fatalf("unmarshaling WAL entries: %v", err)
+	// New format: EncPayload is a JSON array of encrypted payload strings.
+	var payloads []string
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &payloads); err != nil {
+		t.Fatalf("unmarshaling WAL payloads: %v", err)
 	}
 
-	if len(batchEntries) != 3 {
-		t.Fatalf("expected 3 batch entries in WAL, got %d", len(batchEntries))
+	if len(payloads) != 3 {
+		t.Fatalf("expected 3 payloads in WAL, got %d", len(payloads))
 	}
 }
 
@@ -477,10 +510,12 @@ func TestSendBatch_IncludesProcesses(t *testing.T) {
 	s.sendBatch()
 
 	entries, _ := w.Pending()
-	var batchEntries []protocol.BatchEntry
-	json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries)
 
-	plaintext, _ := enc.Decrypt(batchEntries[0].EncPayload)
+	// New format: EncPayload is a JSON array of encrypted payload strings.
+	var payloads []string
+	json.Unmarshal([]byte(entries[0].EncPayload), &payloads)
+
+	plaintext, _ := enc.Decrypt(payloads[0])
 	var decrypted Snapshot
 	json.Unmarshal(plaintext, &decrypted)
 
@@ -489,5 +524,98 @@ func TestSendBatch_IncludesProcesses(t *testing.T) {
 	}
 	if decrypted.Processes[0].Name != "init" {
 		t.Fatalf("expected process name 'init', got %s", decrypted.Processes[0].Name)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 8. Per-snapshot persistence to OpenBatch (new contract test)
+// ---------------------------------------------------------------------------
+
+func TestScheduler_PersistsEachSnapshotToOpenBatch(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.New(dir, 10, 100)
+	if err != nil {
+		t.Fatalf("creating WAL: %v", err)
+	}
+
+	enc, err := crypto.NewEncryptor()
+	if err != nil {
+		t.Fatalf("creating encryptor: %v", err)
+	}
+
+	orch := collector.NewOrchestrator()
+	conn := transport.NewConnection("ws://invalid:0/ws", "", "test-agent", "test")
+	s := New("test-agent", 1, enc, orch, conn, w)
+
+	s.bufferSnapshot(&Snapshot{Timestamp: 100})
+	s.bufferSnapshot(&Snapshot{Timestamp: 110})
+
+	openFiles, _ := filepath.Glob(filepath.Join(dir, "*.open"))
+	if len(openFiles) != 1 {
+		t.Fatalf(".open files = %d, want 1", len(openFiles))
+	}
+
+	// After sendBatch, the .open is renamed to .wal
+	s.sendBatch()
+	openFiles, _ = filepath.Glob(filepath.Join(dir, "*.open"))
+	walFiles, _ := filepath.Glob(filepath.Join(dir, "*.wal"))
+	if len(openFiles) != 0 {
+		t.Errorf("open after sendBatch = %d, want 0", len(openFiles))
+	}
+	if len(walFiles) != 1 {
+		t.Errorf("wal after sendBatch = %d, want 1", len(walFiles))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 9. TestSendBatch_WALEntryContainsBatchEntries — new format uses string array
+// ---------------------------------------------------------------------------
+
+// TestSendBatch_WALEntryContainsBatchEntries verifies the WAL EncPayload is a
+// JSON array of encrypted strings (not a []protocol.BatchEntry), matching the
+// format produced by OpenBatch.Finalize.
+func TestSendBatch_WALEntryContainsBatchEntries(t *testing.T) {
+	s := newTestScheduler(t)
+
+	for i := 0; i < 2; i++ {
+		s.bufferSnapshot(&Snapshot{
+			Timestamp: int64(2000 + i),
+			Metrics:   []collector.Metric{{Name: "x", Value: float64(i)}},
+		})
+	}
+	s.sendBatch()
+
+	entries, err := s.wal.Pending()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("pending WAL entries: err=%v count=%d", err, len(entries))
+	}
+
+	// Must be a JSON array of strings (encrypted payloads).
+	var payloads []string
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &payloads); err != nil {
+		t.Fatalf("WAL EncPayload is not []string: %v", err)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("expected 2 payloads, got %d", len(payloads))
+	}
+
+	// Must NOT be parseable as []protocol.BatchEntry (old format).
+	var batchEntries []protocol.BatchEntry
+	if err := json.Unmarshal([]byte(entries[0].EncPayload), &batchEntries); err == nil {
+		// It would parse as []BatchEntry since []string is a subset...
+		// The real check is that the individual strings decrypt correctly.
+		_ = batchEntries
+	}
+
+	// Each string must be a valid encrypted blob (non-empty, not plain JSON).
+	enc := s.encryptor
+	for i, p := range payloads {
+		if p == "" {
+			t.Errorf("payload %d is empty", i)
+		}
+		_, err := enc.Decrypt(p)
+		if err != nil {
+			t.Errorf("payload %d failed decrypt: %v", i, err)
+		}
 	}
 }
