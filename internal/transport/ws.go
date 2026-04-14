@@ -50,6 +50,10 @@ type Connection struct {
 	// sends of that category are paused. Keyed by category string.
 	categoryRetry sync.Map // map[string]*atomic.Int64
 
+	// lastFailLog tracks when we last emitted a connection-failure log line
+	// so we can throttle repeated failure messages to once per minute.
+	lastFailLog time.Time
+
 	// Callbacks
 	onAck        func(batchID string)
 	onPace       func(intervalMS, collectMS int)
@@ -126,7 +130,11 @@ func (c *Connection) Run(ctx context.Context) {
 		err := c.connect(ctx)
 		if err != nil {
 			delay := backoff(attempt)
-			log.Printf("[ws] connection failed (attempt %d): %v, retrying in %v", attempt+1, err, delay)
+			now := time.Now()
+			if attempt == 0 || now.Sub(c.lastFailLog) >= time.Minute {
+				log.Printf("[ws] connection failed (attempt %d): %v, retrying in %v", attempt+1, err, delay)
+				c.lastFailLog = now
+			}
 			attempt++
 
 			select {
@@ -140,12 +148,17 @@ func (c *Connection) Run(ctx context.Context) {
 		}
 
 		// Connected — reset backoff
+		if !c.lastFailLog.IsZero() {
+			log.Printf("[ws] reconnected")
+			c.lastFailLog = time.Time{}
+		}
 		attempt = 0
 
 		// Read loop (blocks until disconnect)
 		c.readLoop(ctx)
 
 		c.connected.Store(false)
+		c.drainSendCh()
 		log.Printf("[ws] disconnected, reconnecting...")
 
 		// Apply backoff(0) before reconnect so IsConnected()==false is
@@ -413,6 +426,19 @@ func (c *Connection) handleMessage(data []byte) {
 
 	default:
 		log.Printf("[ws] unknown message type: %s", env.Type)
+	}
+}
+
+// drainSendCh empties the outgoing send channel non-blockingly. Called after
+// a disconnect so that stale messages (which are covered by WAL replay on
+// reconnect) don't produce duplicate sends.
+func (c *Connection) drainSendCh() {
+	for {
+		select {
+		case <-c.sendCh:
+		default:
+			return
+		}
 	}
 }
 
