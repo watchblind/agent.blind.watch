@@ -358,6 +358,53 @@ func TestConnectionLiveMessages(t *testing.T) {
 	}
 }
 
+func TestConnection_DetectsHalfOpen(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(*http.Request) bool { return true },
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		c.WriteJSON(map[string]any{"type": "connected", "pace": map[string]int{"interval_ms": 0, "collect_ms": 10000}})
+		select {} // accept but never pong/read
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn := NewConnection(wsURL, "tok", "ag", "test")
+	conn.SetPingInterval(200 * time.Millisecond)
+	conn.SetReadDeadline(600 * time.Millisecond)
+
+	connectedCh := make(chan struct{}, 1)
+	conn.OnConnected(func(protocol.PaceConfig) {
+		select {
+		case connectedCh <- struct{}{}:
+		default:
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go conn.Run(ctx)
+
+	select {
+	case <-connectedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("never connected")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !conn.IsConnected() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("expected disconnect detection within 2s, IsConnected still true")
+}
+
 func TestConnectionPayloadOpacity(t *testing.T) {
 	// Verify that the server only sees encrypted payloads, never plaintext
 	ts := newTestServer(protocol.PaceConfig{IntervalMS: 0, CollectMS: 10000})

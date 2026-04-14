@@ -23,6 +23,11 @@ type sendItem struct {
 	category string // "live", "batch", "wal", "other"
 }
 
+const (
+	defaultPingInterval = 15 * time.Second
+	defaultReadDeadline = 45 * time.Second
+)
+
 // Connection manages a persistent WebSocket connection to the server.
 // It handles reconnection with exponential backoff and message routing.
 type Connection struct {
@@ -38,6 +43,9 @@ type Connection struct {
 	stopCh    chan struct{}
 	sendCh    chan sendItem
 
+	pingInterval time.Duration
+	readDeadline time.Duration
+
 	// Per-category retryUntil — unix millisecond timestamp until which
 	// sends of that category are paused. Keyed by category string.
 	categoryRetry sync.Map // map[string]*atomic.Int64
@@ -50,6 +58,9 @@ type Connection struct {
 	onConnected  func(pace protocol.PaceConfig)
 	onDEKRotated func(newEpoch int)
 }
+
+func (c *Connection) SetPingInterval(d time.Duration) { c.pingInterval = d }
+func (c *Connection) SetReadDeadline(d time.Duration) { c.readDeadline = d }
 
 // msgCategory maps a message type to a rate-limit category.
 func msgCategory(msgType string) string {
@@ -68,12 +79,14 @@ func msgCategory(msgType string) string {
 // NewConnection creates a new WebSocket connection manager.
 func NewConnection(url, token, agentID, version string) *Connection {
 	return &Connection{
-		url:     url,
-		token:   token,
-		agentID: agentID,
-		version: version,
-		stopCh:  make(chan struct{}),
-		sendCh:  make(chan sendItem, 256),
+		url:          url,
+		token:        token,
+		agentID:      agentID,
+		version:      version,
+		stopCh:       make(chan struct{}),
+		sendCh:       make(chan sendItem, 256),
+		pingInterval: defaultPingInterval,
+		readDeadline: defaultReadDeadline,
 	}
 }
 
@@ -134,6 +147,17 @@ func (c *Connection) Run(ctx context.Context) {
 
 		c.connected.Store(false)
 		log.Printf("[ws] disconnected, reconnecting...")
+
+		// Apply backoff(0) before reconnect so IsConnected()==false is
+		// observable for at least the backoff window (1s + jitter).
+		delay := backoff(0)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		case <-c.stopCh:
+			return
+		}
 	}
 }
 
@@ -213,10 +237,16 @@ func (c *Connection) connect(ctx context.Context) error {
 	c.conn = conn
 	c.connMu.Unlock()
 
-	// Start write pump
-	go c.writePump(ctx)
+	// Set initial read deadline and refresh it on every pong received.
+	conn.SetReadDeadline(time.Now().Add(c.readDeadline))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(c.readDeadline))
+	})
 
-	c.connected.Store(true)
+	// Start write pump and ping loop
+	go c.writePump(ctx)
+	go c.pingLoop(ctx, conn)
+
 	return nil
 }
 
@@ -242,7 +272,35 @@ func (c *Connection) readLoop(ctx context.Context) {
 			return
 		}
 
+		conn.SetReadDeadline(time.Now().Add(c.readDeadline))
 		c.handleMessage(data)
+	}
+}
+
+func (c *Connection) pingLoop(ctx context.Context, conn *websocket.Conn) {
+	if c.pingInterval <= 0 {
+		return
+	}
+	t := time.NewTicker(c.pingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.stopCh:
+			return
+		case <-t.C:
+			c.connMu.Lock()
+			cur := c.conn
+			c.connMu.Unlock()
+			if cur != conn {
+				return
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			if err := cur.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				return
+			}
+		}
 	}
 }
 
@@ -290,8 +348,11 @@ func (c *Connection) handleMessage(data []byte) {
 	switch env.Type {
 	case "connected":
 		var msg protocol.ConnectedMessage
-		if json.Unmarshal(data, &msg) == nil && c.onConnected != nil {
-			c.onConnected(msg.Pace)
+		if json.Unmarshal(data, &msg) == nil {
+			c.connected.Store(true)
+			if c.onConnected != nil {
+				c.onConnected(msg.Pace)
+			}
 		}
 
 	case "ack":
