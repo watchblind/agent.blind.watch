@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
@@ -127,4 +128,59 @@ func (ob *OpenBatch) Count() int {
 // Meta returns a copy of the batch metadata.
 func (ob *OpenBatch) Meta() BatchMeta {
 	return ob.meta
+}
+
+// EntryRecord is one payload line in an .open or recovered .wal file. The CRC
+// is computed over the JSON encoding of the same struct with CRC=0 (so a
+// reader can recompute and compare). All fields except CRC are required.
+type EntryRecord struct {
+	Epoch      int    `json:"epoch"`
+	Timestamp  int64  `json:"timestamp"`
+	EncPayload string `json:"enc_payload"`
+	CRC        uint32 `json:"crc"`
+}
+
+// crcTable uses Castagnoli (the same polynomial as ext4 / btrfs / Snappy).
+// Faster than IEEE on modern CPUs and adequate for torn-write detection.
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+func computeCRC(rec EntryRecord) (uint32, []byte, error) {
+	rec.CRC = 0
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return 0, nil, err
+	}
+	return crc32.Checksum(data, crcTable), data, nil
+}
+
+// Append serializes rec, computes its CRC, writes it as a single NDJSON line,
+// and fsyncs. Safe for concurrent calls from multiple goroutines on the same
+// OpenBatch.
+func (ob *OpenBatch) Append(rec EntryRecord) error {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return fmt.Errorf("openbatch: closed")
+	}
+
+	crc, _, err := computeCRC(rec)
+	if err != nil {
+		return fmt.Errorf("compute crc: %w", err)
+	}
+	rec.CRC = crc
+
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("marshal entry: %w", err)
+	}
+	line = append(line, '\n')
+
+	if _, err := ob.file.Write(line); err != nil {
+		return fmt.Errorf("write entry: %w", err)
+	}
+	if err := ob.file.Sync(); err != nil {
+		return fmt.Errorf("fsync entry: %w", err)
+	}
+	ob.count++
+	return nil
 }

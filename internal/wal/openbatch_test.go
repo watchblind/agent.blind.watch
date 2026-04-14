@@ -3,8 +3,10 @@ package wal
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -64,5 +66,45 @@ func TestOpenBatch_DuplicateOpenFails(t *testing.T) {
 	defer ob1.Close()
 	if _, err := w.OpenBatch(meta); err == nil {
 		t.Error("expected error opening same batch_id twice")
+	}
+}
+
+func TestOpenBatch_AppendPersistsAndCRCs(t *testing.T) {
+	w, _ := New(t.TempDir(), 10, 100)
+	ob, err := w.OpenBatch(BatchMeta{BatchID: "b1", AgentID: "ag", Epoch: 1, StartedAt: 100})
+	if err != nil {
+		t.Fatalf("OpenBatch: %v", err)
+	}
+	defer ob.Close()
+
+	for i, ts := range []int64{110, 120, 130} {
+		if err := ob.Append(EntryRecord{
+			Epoch:      1,
+			Timestamp:  ts,
+			EncPayload: fmt.Sprintf("ct-%d", i),
+		}); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+	if ob.Count() != 3 {
+		t.Errorf("Count = %d, want 3", ob.Count())
+	}
+
+	raw, err := os.ReadFile(filepath.Join(w.Dir(), "b1.open"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4: %q", len(lines), lines)
+	}
+	for i, line := range lines[1:] {
+		var rec EntryRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line %d not JSON: %v", i, err)
+		}
+		if rec.CRC == 0 {
+			t.Errorf("line %d has zero CRC", i)
+		}
 	}
 }
