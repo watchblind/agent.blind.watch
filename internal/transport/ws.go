@@ -55,12 +55,13 @@ type Connection struct {
 	lastFailLog time.Time
 
 	// Callbacks
-	onAck        func(batchID string)
-	onPace       func(intervalMS, collectMS int)
-	onConfig     func(encConfig string)
-	onDisconnect func(reason string)
-	onConnected  func(pace protocol.PaceConfig)
-	onDEKRotated func(newEpoch int)
+	onAck          func(batchID string)
+	onPace         func(intervalMS, collectMS int)
+	onConfig       func(encConfig string)
+	onDisconnect   func(reason string)
+	onConnected    func(pace protocol.PaceConfig)
+	onDEKRotated   func(newEpoch int)
+	onPathsPreview func(req protocol.PathsPreviewRequest)
 }
 
 func (c *Connection) SetPingInterval(d time.Duration) { c.pingInterval = d }
@@ -102,12 +103,13 @@ func (c *Connection) getRetryUntil(category string) *atomic.Int64 {
 
 // Callbacks
 
-func (c *Connection) OnAck(fn func(batchID string))                { c.onAck = fn }
-func (c *Connection) OnPace(fn func(intervalMS, collectMS int))     { c.onPace = fn }
-func (c *Connection) OnConfig(fn func(encConfig string))             { c.onConfig = fn }
-func (c *Connection) OnDisconnect(fn func(reason string))           { c.onDisconnect = fn }
-func (c *Connection) OnConnected(fn func(pace protocol.PaceConfig)) { c.onConnected = fn }
-func (c *Connection) OnDEKRotated(fn func(newEpoch int))            { c.onDEKRotated = fn }
+func (c *Connection) OnAck(fn func(batchID string))                       { c.onAck = fn }
+func (c *Connection) OnPace(fn func(intervalMS, collectMS int))            { c.onPace = fn }
+func (c *Connection) OnConfig(fn func(encConfig string))                   { c.onConfig = fn }
+func (c *Connection) OnDisconnect(fn func(reason string))                  { c.onDisconnect = fn }
+func (c *Connection) OnConnected(fn func(pace protocol.PaceConfig))        { c.onConnected = fn }
+func (c *Connection) OnDEKRotated(fn func(newEpoch int))                   { c.onDEKRotated = fn }
+func (c *Connection) OnPathsPreview(fn func(protocol.PathsPreviewRequest)) { c.onPathsPreview = fn }
 
 // IsConnected returns whether the WebSocket is currently connected.
 func (c *Connection) IsConnected() bool {
@@ -422,6 +424,12 @@ func (c *Connection) handleMessage(data []byte) {
 				}
 				log.Printf("[ws] pausing all sends for %ds (until %s)", msg.RetryAfter, until.Format("15:04:05"))
 			}
+		}
+
+	case "paths_preview_request":
+		var msg protocol.PathsPreviewRequest
+		if json.Unmarshal(data, &msg) == nil && c.onPathsPreview != nil {
+			go c.onPathsPreview(msg)
 		}
 
 	default:

@@ -21,6 +21,7 @@ import (
 	"github.com/watchblind/agent/internal/crypto"
 	"github.com/watchblind/agent/internal/dashboard"
 	"github.com/watchblind/agent/internal/logtail"
+	"github.com/watchblind/agent/internal/pathbrowser"
 	"github.com/watchblind/agent/internal/protocol"
 	"github.com/watchblind/agent/internal/provision"
 	"github.com/watchblind/agent/internal/scheduler"
@@ -339,6 +340,27 @@ func main() {
 		sched.SetEncryptor(newEnc, newEpoch)
 		logMgr.SetEncryptor(newEnc, newEpoch)
 		log.Printf("[agent] DEK rotation complete: now using epoch %d", newEpoch)
+	})
+
+	conn.OnPathsPreview(func(req protocol.PathsPreviewRequest) {
+		listing := pathbrowser.ListDir(req.Path)
+		plain, _ := json.Marshal(listing)
+		enc, epoch := sched.EncryptorAndEpoch()
+		if enc == nil {
+			log.Printf("[paths] no encryptor, dropping preview response")
+			return
+		}
+		encListing, err := enc.Encrypt(plain)
+		if err != nil {
+			log.Printf("[paths] encrypt error: %v", err)
+			return
+		}
+		_ = conn.Send(protocol.PathsPreviewResponse{
+			Type:       "paths_preview_response",
+			RequestID:  req.RequestID,
+			Epoch:      epoch,
+			EncListing: encListing,
+		})
 	})
 
 	// Default collection interval (overridden by server pace)
