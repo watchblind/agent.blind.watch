@@ -218,9 +218,13 @@ func main() {
 	// Wire log manager into scheduler for live mode control and replay
 	sched.SetLogManager(logMgr)
 
-	// Wire callbacks
+	// Wire callbacks — dash may be nil when --dashboard=false, set after construction
+	var dash *dashboard.Dashboard
 	conn.OnAck(func(batchID string) {
 		sched.AckBatch(batchID)
+		if dash != nil {
+			dash.NoteAck()
+		}
 	})
 
 	conn.OnPace(func(intervalMS, collectMS int) {
@@ -394,7 +398,7 @@ func main() {
 		go sched.Run(ctx)
 		go logMgr.Run(ctx)
 
-		dash := dashboard.New(snapCh, alertCh, eval.States(), snd, procCol)
+		dash = dashboard.New(snapCh, alertCh, eval.States(), snd, procCol, w)
 		if err := dash.Run(); err != nil {
 			log.Fatalf("Dashboard error: %v", err)
 		}

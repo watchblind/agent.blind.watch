@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/watchblind/agent/internal/alert"
 	"github.com/watchblind/agent/internal/collector"
 	"github.com/watchblind/agent/internal/sender"
+	"github.com/watchblind/agent/internal/wal"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -27,6 +29,8 @@ type Dashboard struct {
 	alertState *alert.StateTracker
 	sender     *sender.MockSender
 	procCol    *collector.ProcessCollector
+	wal        *wal.WAL
+	lastAckTS  atomic.Int64
 }
 
 func New(
@@ -35,6 +39,7 @@ func New(
 	alertState *alert.StateTracker,
 	snd *sender.MockSender,
 	procCol *collector.ProcessCollector,
+	w *wal.WAL,
 ) *Dashboard {
 	return &Dashboard{
 		snapCh:     snapCh,
@@ -42,8 +47,13 @@ func New(
 		alertState: alertState,
 		sender:     snd,
 		procCol:    procCol,
+		wal:        w,
 	}
 }
+
+// NoteAck records that a server ack was received now. Used by the dashboard to
+// display "seconds since last ack" as a reconnection / data-flow indicator.
+func (d *Dashboard) NoteAck() { d.lastAckTS.Store(time.Now().Unix()) }
 
 func (d *Dashboard) Run() error {
 	d.app = tview.NewApplication()
@@ -180,8 +190,17 @@ func (d *Dashboard) updateMetrics(snap collector.Snapshot) {
 			tview.NewTableCell(formatLabels(m.Labels)).SetTextColor(tcell.ColorGray))
 	}
 
-	d.statusBar.SetText(fmt.Sprintf("[yellow]blind.watch agent[white] | [green]%d[white] metrics | Updated %s | Press [green]q[white] to quit",
-		len(metrics), snap.Timestamp.Format("15:04:05")))
+	files := d.wal.Count()
+	bytes := d.wal.PendingBytes()
+	last := d.lastAckTS.Load()
+	since := "never"
+	if last > 0 {
+		since = fmt.Sprintf("%ds", time.Now().Unix()-last)
+	}
+	d.statusBar.SetText(fmt.Sprintf(
+		"[yellow]blind.watch agent[white] | [green]%d[white] metrics | WAL [green]%d[white] files / [green]%s[white] | last ack [green]%s[white] | %s | [green]q[white]=quit",
+		len(metrics), files, formatBytes(float64(bytes)), since, snap.Timestamp.Format("15:04:05"),
+	))
 }
 
 func (d *Dashboard) updateProcesses(procs []collector.ProcessInfo) {
