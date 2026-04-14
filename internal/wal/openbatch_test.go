@@ -108,3 +108,50 @@ func TestOpenBatch_AppendPersistsAndCRCs(t *testing.T) {
 		}
 	}
 }
+
+func TestFinalize_RenamesAndReturnsEntry(t *testing.T) {
+	w, _ := New(t.TempDir(), 10, 100)
+	ob, _ := w.OpenBatch(BatchMeta{BatchID: "b1", AgentID: "ag", Epoch: 2, StartedAt: 500})
+	for _, ts := range []int64{510, 520} {
+		ob.Append(EntryRecord{Epoch: 2, Timestamp: ts, EncPayload: "x"})
+	}
+
+	entry, err := ob.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if entry.BatchID != "b1" || entry.AgentID != "ag" || entry.Epoch != 2 {
+		t.Errorf("entry meta wrong: %+v", entry)
+	}
+	if entry.Timestamp != 500 {
+		t.Errorf("entry.Timestamp = %d, want 500 (StartedAt)", entry.Timestamp)
+	}
+
+	if _, err := os.Stat(filepath.Join(w.Dir(), "b1.open")); !os.IsNotExist(err) {
+		t.Error(".open file still present after Finalize")
+	}
+	if _, err := os.Stat(filepath.Join(w.Dir(), "b1.wal")); err != nil {
+		t.Errorf(".wal file not created: %v", err)
+	}
+
+	var payloads []string
+	if err := json.Unmarshal([]byte(entry.EncPayload), &payloads); err != nil {
+		t.Fatalf("EncPayload not JSON array: %v", err)
+	}
+	if len(payloads) != 2 {
+		t.Errorf("got %d payloads, want 2", len(payloads))
+	}
+}
+
+func TestFinalize_EmptyBatchRemovesFile(t *testing.T) {
+	w, _ := New(t.TempDir(), 10, 100)
+	ob, _ := w.OpenBatch(BatchMeta{BatchID: "b1", AgentID: "ag", Epoch: 1, StartedAt: 100})
+
+	_, err := ob.Finalize()
+	if err != ErrEmptyBatch {
+		t.Errorf("Finalize empty batch err = %v, want ErrEmptyBatch", err)
+	}
+	if _, err := os.Stat(filepath.Join(w.Dir(), "b1.open")); !os.IsNotExist(err) {
+		t.Error(".open file still present after empty Finalize")
+	}
+}
