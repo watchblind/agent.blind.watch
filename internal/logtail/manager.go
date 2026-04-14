@@ -1,10 +1,12 @@
 package logtail
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -16,10 +18,7 @@ import (
 )
 
 const (
-	// MaxBatchSize is the memory-safety cap for log entries per batch.
-	// Triggers early flush on very chatty servers to prevent OOM.
-	MaxBatchSize = 50000
-	// batchInterval is the normal batch interval, wall-clock aligned like metrics.
+	// logBatchInterval is the normal batch interval, wall-clock aligned like metrics.
 	logBatchInterval = 10 * time.Minute
 	// entryChannelSize is the buffer for the shared log entry channel.
 	entryChannelSize = 10000
@@ -51,9 +50,10 @@ type Manager struct {
 	liveMu sync.RWMutex
 	live   bool
 
-	// Batch buffer (protected by batchMu for BufferedEntries access)
-	batchMu sync.Mutex
-	batch   []LogEntry
+	// OpenBatch — each incoming log entry is encrypted + persisted immediately.
+	openMu    sync.Mutex
+	openBatch *wal.OpenBatch
+	openID    string
 
 	// Active tailers keyed by source path/label
 	tailerMu sync.Mutex
@@ -111,44 +111,45 @@ func (m *Manager) SetLive(live bool) {
 	}
 }
 
-// BufferedEntries returns the current batch buffer as encrypted log entries
-// for replay on live mode activation. Does not drain the buffer.
+// BufferedEntries returns the entries in the current in-progress .open file
+// as encrypted log batch entries, for replay on live mode activation.
+// Does not drain or close the open batch.
 func (m *Manager) BufferedEntries() []protocol.LogBatchEntry {
-	m.mu.RLock()
-	enc := m.encryptor
-	epoch := m.epoch
-	_ = epoch
-	m.mu.RUnlock()
+	m.openMu.Lock()
+	openID := m.openID
+	ob := m.openBatch
+	m.openMu.Unlock()
 
-	if enc == nil {
+	if ob == nil || openID == "" {
 		return nil
 	}
 
-	m.batchMu.Lock()
-	entries := make([]LogEntry, len(m.batch))
-	copy(entries, m.batch)
-	m.batchMu.Unlock()
-
-	if len(entries) == 0 {
+	path := filepath.Join(m.walLog.Dir(), openID+".open")
+	f, err := os.Open(path)
+	if err != nil {
 		return nil
 	}
+	defer f.Close()
 
-	var result []protocol.LogBatchEntry
-	for _, entry := range entries {
-		plaintext, err := json.Marshal(entry)
-		if err != nil {
-			continue
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	first := true
+	var entries []protocol.LogBatchEntry
+	for scanner.Scan() {
+		if first {
+			first = false
+			continue // skip meta line
 		}
-		encrypted, err := enc.Encrypt(plaintext)
-		if err != nil {
-			continue
+		var rec wal.EntryRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			break
 		}
-		result = append(result, protocol.LogBatchEntry{
-			Timestamp:  entry.Timestamp,
-			EncPayload: encrypted,
+		entries = append(entries, protocol.LogBatchEntry{
+			Timestamp:  rec.Timestamp,
+			EncPayload: rec.EncPayload,
 		})
 	}
-	return result
+	return entries
 }
 
 // SetEncryptor updates the encryptor and epoch (DEK rotation).
@@ -236,8 +237,113 @@ func timeUntilNextLogBatch() time.Duration {
 	return d
 }
 
+// handleLogEntry encrypts and appends a single log entry to the open batch,
+// creating the batch file on first call. Also forwards to live mode if active.
+func (m *Manager) handleLogEntry(entry LogEntry) {
+	m.mu.RLock()
+	enc := m.encryptor
+	epoch := m.epoch
+	m.mu.RUnlock()
+
+	if enc == nil {
+		return
+	}
+
+	plaintext, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	encrypted, err := enc.Encrypt(plaintext)
+	if err != nil {
+		return
+	}
+
+	m.openMu.Lock()
+	defer m.openMu.Unlock()
+
+	if m.openBatch == nil {
+		batchID := fmt.Sprintf("lb_%d_%s", time.Now().Unix(), m.agentID)
+		ob, err := m.walLog.OpenBatch(wal.BatchMeta{
+			BatchID:   batchID,
+			AgentID:   m.agentID,
+			Epoch:     epoch,
+			StartedAt: entry.Timestamp,
+		})
+		if err != nil {
+			log.Printf("[logtail] OpenBatch error: %v", err)
+			return
+		}
+		m.openBatch = ob
+		m.openID = batchID
+	}
+
+	if err := m.openBatch.Append(wal.EntryRecord{
+		Epoch:      epoch,
+		Timestamp:  entry.Timestamp,
+		EncPayload: encrypted,
+	}); err != nil {
+		log.Printf("[logtail] OpenBatch.Append error: %v", err)
+	}
+
+	m.liveMu.RLock()
+	isLive := m.live
+	m.liveMu.RUnlock()
+	if isLive {
+		m.SendLive(entry)
+	}
+}
+
+// flushOpenBatch finalizes the current open batch and sends it.
+// If there is no open batch, or the batch is empty, it is a no-op.
+func (m *Manager) flushOpenBatch() {
+	m.openMu.Lock()
+	ob := m.openBatch
+	m.openBatch = nil
+	m.openID = ""
+	m.openMu.Unlock()
+
+	if ob == nil {
+		return
+	}
+
+	entry, err := ob.Finalize()
+	if err == wal.ErrEmptyBatch {
+		return
+	}
+	if err != nil {
+		log.Printf("[logtail] Finalize error: %v", err)
+		return
+	}
+
+	var payloads []string
+	if err := json.Unmarshal([]byte(entry.EncPayload), &payloads); err != nil {
+		log.Printf("[logtail] decode payloads error: %v", err)
+		return
+	}
+
+	protoEntries := make([]protocol.LogBatchEntry, len(payloads))
+	for i, p := range payloads {
+		protoEntries[i] = protocol.LogBatchEntry{
+			Timestamp:  entry.Timestamp + int64(i),
+			EncPayload: p,
+		}
+	}
+
+	if err := m.conn.Send(protocol.LogBatchMessage{
+		Type:    "log_batch",
+		BatchID: entry.BatchID,
+		Epoch:   entry.Epoch,
+		Entries: protoEntries,
+	}); err != nil {
+		log.Printf("[logtail] send error: %v (data in WAL)", err)
+	} else {
+		log.Printf("[logtail] batch sent: %s (%d entries)", entry.BatchID, len(protoEntries))
+	}
+}
+
 // Run starts the batch sender loop. Blocks until ctx is cancelled.
-// Batches log entries for 10 minutes (wall-clock aligned, same as metrics).
+// Each log entry is encrypted and persisted to an open batch file immediately.
+// The batch is finalized and sent at each 10-minute wall-clock boundary.
 func (m *Manager) Run(ctx context.Context) {
 	// Wall-clock-aligned batch timer
 	batchTimer := time.NewTimer(timeUntilNextLogBatch())
@@ -249,131 +355,26 @@ func (m *Manager) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Flush remaining entries
-			m.batchMu.Lock()
-			batch := m.batch
-			m.batch = nil
-			m.batchMu.Unlock()
-			if len(batch) > 0 {
-				m.sendBatch(batch)
-			}
+			m.flushOpenBatch()
 			m.stopAllTailers()
 			m.store.Flush()
 			return
 
 		case entry := <-m.entries:
-			// Buffer the entry
-			m.batchMu.Lock()
-			m.batch = append(m.batch, entry)
-			batchLen := len(m.batch)
-			m.batchMu.Unlock()
-
-			// Also send live if viewer is connected
-			m.liveMu.RLock()
-			isLive := m.live
-			m.liveMu.RUnlock()
-			if isLive {
-				m.SendLive(entry)
-			}
-
-			// Memory safety: early flush if batch is huge
-			if batchLen >= MaxBatchSize {
-				m.batchMu.Lock()
-				batch := m.batch
-				m.batch = nil
-				m.batchMu.Unlock()
-				m.sendBatch(batch)
-			}
+			m.handleLogEntry(entry)
 
 		case <-batchTimer.C:
-			// 10-minute wall-clock boundary: flush batch
-			m.batchMu.Lock()
-			batch := m.batch
-			m.batch = nil
-			m.batchMu.Unlock()
-			if len(batch) > 0 {
-				m.sendBatch(batch)
-			}
+			m.flushOpenBatch()
 			batchTimer.Reset(timeUntilNextLogBatch())
 
 		case <-m.flushCh:
-			m.batchMu.Lock()
-			batch := m.batch
-			m.batch = nil
-			m.batchMu.Unlock()
-			if len(batch) > 0 {
-				m.sendBatch(batch)
-			}
+			m.flushOpenBatch()
 
 		case <-posTicker.C:
 			if err := m.store.Flush(); err != nil {
 				log.Printf("[logtail] position flush error: %v", err)
 			}
 		}
-	}
-}
-
-func (m *Manager) sendBatch(entries []LogEntry) {
-	m.mu.RLock()
-	enc := m.encryptor
-	epoch := m.epoch
-	m.mu.RUnlock()
-
-	if enc == nil {
-		return
-	}
-
-	// Encrypt each entry individually
-	protoEntries := make([]protocol.LogBatchEntry, 0, len(entries))
-	for _, entry := range entries {
-		plaintext, err := json.Marshal(entry)
-		if err != nil {
-			log.Printf("[logtail] marshal error: %v", err)
-			continue
-		}
-
-		encrypted, err := enc.Encrypt(plaintext)
-		if err != nil {
-			log.Printf("[logtail] encrypt error: %v", err)
-			continue
-		}
-
-		protoEntries = append(protoEntries, protocol.LogBatchEntry{
-			Timestamp:  entry.Timestamp,
-			EncPayload: encrypted,
-		})
-	}
-
-	if len(protoEntries) == 0 {
-		return
-	}
-
-	batchID := fmt.Sprintf("lb_%d_%s", time.Now().Unix(), m.agentID)
-
-	// Persist to WAL
-	walPayload, _ := json.Marshal(protoEntries)
-	walEntry := wal.Entry{
-		BatchID:    batchID,
-		AgentID:    m.agentID,
-		Epoch:      epoch,
-		Timestamp:  time.Now().Unix(),
-		EncPayload: string(walPayload),
-	}
-	if err := m.walLog.Append(walEntry); err != nil {
-		log.Printf("[logtail] WAL append error: %v", err)
-	}
-
-	msg := protocol.LogBatchMessage{
-		Type:    "log_batch",
-		BatchID: batchID,
-		Epoch:   epoch,
-		Entries: protoEntries,
-	}
-
-	if err := m.conn.Send(msg); err != nil {
-		log.Printf("[logtail] send error: %v (data in WAL)", err)
-	} else {
-		log.Printf("[logtail] batch sent: %s (%d entries)", batchID, len(protoEntries))
 	}
 }
 
