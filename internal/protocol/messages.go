@@ -132,3 +132,19 @@ type LiveLogMessage struct {
 type Envelope struct {
 	Type string `json:"type"`
 }
+
+// PathsPreviewRequest is the server -> agent request carrying a directory path
+// to enumerate. Plaintext; the path itself is not a secret.
+type PathsPreviewRequest struct {
+	Type      string `json:"type"`       // always "paths_preview_request"
+	RequestID string `json:"request_id"`
+	Path      string `json:"path"`
+}
+
+// PathsPreviewResponse is the agent -> server reply with the encrypted Listing.
+type PathsPreviewResponse struct {
+	Type       string `json:"type"`        // always "paths_preview_response"
+	RequestID  string `json:"request_id"`
+	Epoch      int    `json:"epoch"`
+	EncListing string `json:"enc_listing"` // base64 AES-GCM of pathbrowser.Listing JSON
+}
