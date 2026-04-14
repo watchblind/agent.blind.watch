@@ -1,11 +1,14 @@
 package wal
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -183,4 +186,97 @@ func (ob *OpenBatch) Append(rec EntryRecord) error {
 	}
 	ob.count++
 	return nil
+}
+
+// ErrEmptyBatch is returned by Finalize when no payload entries were appended.
+// The .open file is removed and the caller should not send any message.
+var ErrEmptyBatch = errors.New("openbatch: no entries appended")
+
+// Finalize closes the .open file, renames it to .wal atomically, and returns a
+// wal.Entry suitable for sending as a batch / wal_sync / flush message. The
+// returned EncPayload is a JSON array of the appended encrypted payload strings,
+// matching the format the scheduler already serializes for transport.
+func (ob *OpenBatch) Finalize() (Entry, error) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return Entry{}, fmt.Errorf("openbatch: closed")
+	}
+	if ob.count == 0 {
+		ob.closed = true
+		ob.file.Close()
+		os.Remove(ob.path)
+		fsyncDir(filepath.Dir(ob.path))
+		return Entry{}, ErrEmptyBatch
+	}
+
+	if err := ob.file.Sync(); err != nil {
+		return Entry{}, fmt.Errorf("fsync open file: %w", err)
+	}
+	if err := ob.file.Close(); err != nil {
+		return Entry{}, fmt.Errorf("close open file: %w", err)
+	}
+	ob.closed = true
+
+	payloads, err := readOpenFilePayloads(ob.path)
+	if err != nil {
+		return Entry{}, fmt.Errorf("read open file: %w", err)
+	}
+
+	wrapped, err := json.Marshal(payloads)
+	if err != nil {
+		return Entry{}, fmt.Errorf("marshal payloads: %w", err)
+	}
+
+	finalPath := strings.TrimSuffix(ob.path, ".open") + ".wal"
+	if err := os.Rename(ob.path, finalPath); err != nil {
+		return Entry{}, fmt.Errorf("rename to .wal: %w", err)
+	}
+	if err := fsyncDir(filepath.Dir(finalPath)); err != nil {
+		return Entry{}, fmt.Errorf("fsync dir: %w", err)
+	}
+
+	return Entry{
+		BatchID:    ob.meta.BatchID,
+		AgentID:    ob.meta.AgentID,
+		Epoch:      ob.meta.Epoch,
+		Timestamp:  ob.meta.StartedAt,
+		EncPayload: string(wrapped),
+	}, nil
+}
+
+// readOpenFilePayloads reads an .open or finalized .wal NDJSON file (with meta
+// line + payload lines) and returns the EncPayload strings in file order.
+// Lines that fail JSON parse or CRC validation are dropped — the scan stops at
+// the first bad line (used for both finalize round-trip and crash recovery).
+func readOpenFilePayloads(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var payloads []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // up to 4 MB per line
+	first := true
+	for scanner.Scan() {
+		if first {
+			first = false
+			continue // skip meta
+		}
+		var rec EntryRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			break
+		}
+		want, _, err := computeCRC(rec)
+		if err != nil || want != rec.CRC {
+			break
+		}
+		payloads = append(payloads, rec.EncPayload)
+	}
+	if err := scanner.Err(); err != nil {
+		return payloads, err
+	}
+	return payloads, nil
 }
