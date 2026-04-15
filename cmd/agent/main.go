@@ -28,6 +28,7 @@ import (
 	"github.com/watchblind/agent/internal/sdnotify"
 	"github.com/watchblind/agent/internal/sender"
 	"github.com/watchblind/agent/internal/transport"
+	"github.com/watchblind/agent/internal/updater"
 	"github.com/watchblind/agent/internal/wal"
 )
 
@@ -232,6 +233,9 @@ func main() {
 		sched.SetPace(intervalMS, collectMS)
 	})
 
+	// Auto-update poller context — cancelled and recreated on config change
+	var autoUpdateCancel context.CancelFunc
+
 	// Config push from server — decrypt E2E encrypted config, then apply
 	conn.OnConfig(func(encConfig string) {
 		log.Printf("[agent] received encrypted config (%d bytes)", len(encConfig))
@@ -256,7 +260,8 @@ func main() {
 			Collection struct {
 				IntervalSeconds int `json:"interval_seconds"`
 			} `json:"collection"`
-			LogSources []logtail.LogSourceConfig `json:"log_sources"`
+			LogSources  []logtail.LogSourceConfig `json:"log_sources"`
+			AutoUpdate  *bool                     `json:"auto_update,omitempty"`
 		}
 		if err := json.Unmarshal(plaintext, &cfg); err != nil {
 			log.Printf("[agent] failed to parse decrypted config: %v", err)
@@ -276,16 +281,54 @@ func main() {
 			logMgr.UpdateConfig(cfg.LogSources)
 			log.Printf("[agent] updated %d log sources from server", len(cfg.LogSources))
 		}
+
+		// Manage auto-update poller based on config
+		if cfg.AutoUpdate != nil {
+			// Cancel existing poller if running
+			if autoUpdateCancel != nil {
+				autoUpdateCancel()
+				autoUpdateCancel = nil
+			}
+
+			if *cfg.AutoUpdate {
+				autoCtx, cancelFn := context.WithCancel(ctx)
+				autoUpdateCancel = cancelFn
+				go updater.StartAutoUpdatePoller(autoCtx, conn, version)
+				log.Printf("[agent] auto-update enabled")
+			} else {
+				log.Printf("[agent] auto-update disabled")
+			}
+		}
 	})
 
 	conn.OnConnected(func(pace protocol.PaceConfig) {
 		log.Printf("[agent] connected to server (pace: interval=%dms collect=%dms)",
 			pace.IntervalMS, pace.CollectMS)
 		sched.SetPace(pace.IntervalMS, pace.CollectMS)
+
+		// Send encrypted version report so dashboard can display it
+		currentEnc, currentEpoch := sched.EncryptorAndEpoch()
+		if currentEnc != nil {
+			versionJSON, _ := json.Marshal(map[string]string{"version": version})
+			encVersion, err := currentEnc.Encrypt(versionJSON)
+			if err == nil {
+				conn.Send(protocol.VersionReportMessage{
+					Type:       "version_report",
+					Epoch:      currentEpoch,
+					EncPayload: encVersion,
+				})
+			}
+		}
 	})
 
 	conn.OnDisconnect(func(reason string) {
 		log.Printf("[agent] disconnected by server: %s", reason)
+	})
+
+	// Dashboard-triggered update — run upgrade script in background
+	conn.OnUpdateAvailable(func(targetVersion string) {
+		log.Printf("[agent] update requested: %s -> %s", version, targetVersion)
+		go updater.TriggerUpdate(conn, targetVersion)
 	})
 
 	// DEK rotation — server pushes new epoch, agent fetches and swaps

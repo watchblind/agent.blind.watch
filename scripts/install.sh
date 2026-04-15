@@ -262,7 +262,13 @@ create_data_dir() {
 # --- Install systemd unit (requires root) ---
 install_systemd() {
     if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] && [[ "$UPGRADE" == true ]]; then
-        info "Systemd unit already exists, keeping current"
+        # Patch out directives that block self-update via sudo
+        local svc="/etc/systemd/system/${SERVICE_NAME}.service"
+        if grep -q "NoNewPrivileges=yes" "$svc" 2>/dev/null; then
+            info "Patching systemd unit: removing NoNewPrivileges (required for self-update)..."
+            as_root sed -i '/^NoNewPrivileges=yes$/d; /^RestrictSUIDSGID=yes$/d' "$svc"
+            as_root systemctl daemon-reload
+        fi
         return
     fi
 
@@ -285,7 +291,6 @@ WatchdogSec=300
 
 # Security hardening
 LimitCORE=0
-NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=${DATA_DIR}
@@ -294,7 +299,8 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# NoNewPrivileges and RestrictSUIDSGID are omitted — agent needs sudo for self-update
+# (scoped sudoers entry limits it to /usr/local/lib/blindwatch/upgrade.sh only)
 # MemoryDenyWriteExecute=yes is omitted — Go runtime requires W+X memory
 
 [Install]
@@ -329,6 +335,30 @@ run_first_boot() {
         || fatal "First-boot provisioning failed"
 
     ok "Provisioning complete"
+}
+
+# --- Install upgrade helper + sudoers entry (requires root) ---
+install_upgrade_helper() {
+    info "Installing upgrade helper..."
+    as_root mkdir -p /usr/local/lib/blindwatch
+    as_root tee /usr/local/lib/blindwatch/upgrade.sh > /dev/null << 'UPGRADE'
+#!/bin/bash
+set -euo pipefail
+VERSION="${1:?Usage: upgrade.sh VERSION}"
+# Validate version format (vX.Y.Z or X.Y.Z)
+if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    echo "Invalid version: $VERSION" >&2; exit 1
+fi
+curl -sSL https://get.blind.watch/agent | bash -s -- --upgrade --version "$VERSION"
+UPGRADE
+    as_root chmod 0755 /usr/local/lib/blindwatch/upgrade.sh
+
+    # Sudoers entry — scoped to upgrade script only
+    as_root tee /etc/sudoers.d/blindwatch > /dev/null << SUDOERS
+${SERVICE_USER} ALL=(root) NOPASSWD: /usr/local/lib/blindwatch/upgrade.sh
+SUDOERS
+    as_root chmod 0440 /etc/sudoers.d/blindwatch
+    ok "Upgrade helper installed"
 }
 
 # --- Start service (requires root) ---
@@ -371,6 +401,8 @@ main() {
     create_user
     create_data_dir
     install_systemd
+
+    install_upgrade_helper
 
     if [[ "$UPGRADE" == false ]]; then
         run_first_boot
