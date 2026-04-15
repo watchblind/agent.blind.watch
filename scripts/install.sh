@@ -349,7 +349,11 @@ VERSION="${1:?Usage: upgrade.sh VERSION}"
 if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     echo "Invalid version: $VERSION" >&2; exit 1
 fi
-curl -sSL https://get.blind.watch/agent | bash -s -- --upgrade --version "$VERSION"
+# Run in a transient systemd unit so the upgrade survives the agent service being stopped.
+# Without this, systemd kills all processes in the agent's cgroup (including our children)
+# when the install script runs "systemctl stop blindwatch-agent".
+systemd-run --unit=blindwatch-upgrade --description="blind.watch agent upgrade" \
+    bash -c 'curl -sSL https://get.blind.watch/agent | bash -s -- --upgrade --version "'"$VERSION"'"'
 UPGRADE
     as_root chmod 0755 /usr/local/lib/blindwatch/upgrade.sh
 
