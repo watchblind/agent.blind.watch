@@ -128,6 +128,28 @@ type LiveLogMessage struct {
 	EncPayload string `json:"enc_payload"`
 }
 
+// --- Update messages ---
+
+// UpdateAvailableMessage is sent by the server to trigger an agent self-update.
+type UpdateAvailableMessage struct {
+	Type    string `json:"type"`    // "update_available"
+	Version string `json:"version"` // target version e.g. "0.3.0"
+}
+
+// VersionReportMessage is sent by the agent on connect with its encrypted version.
+type VersionReportMessage struct {
+	Type       string `json:"type"`        // "version_report"
+	Epoch      int    `json:"epoch"`
+	EncPayload string `json:"enc_payload"` // encrypted JSON: {"version":"0.3.0"}
+}
+
+// UpdateStatusMessage reports update progress from agent to server.
+type UpdateStatusMessage struct {
+	Type   string  `json:"type"`             // "update_status"
+	Status string  `json:"status"`           // "downloading" | "staged" | "failed"
+	Error  *string `json:"error,omitempty"`
+}
+
 // Envelope is used for initial JSON parsing to determine message type.
 type Envelope struct {
 	Type string `json:"type"`

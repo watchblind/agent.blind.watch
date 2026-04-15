@@ -55,13 +55,14 @@ type Connection struct {
 	lastFailLog time.Time
 
 	// Callbacks
-	onAck          func(batchID string)
-	onPace         func(intervalMS, collectMS int)
-	onConfig       func(encConfig string)
-	onDisconnect   func(reason string)
-	onConnected    func(pace protocol.PaceConfig)
-	onDEKRotated   func(newEpoch int)
-	onPathsPreview func(req protocol.PathsPreviewRequest)
+	onAck              func(batchID string)
+	onPace             func(intervalMS, collectMS int)
+	onConfig           func(encConfig string)
+	onDisconnect       func(reason string)
+	onConnected        func(pace protocol.PaceConfig)
+	onDEKRotated       func(newEpoch int)
+	onPathsPreview     func(req protocol.PathsPreviewRequest)
+	onUpdateAvailable  func(version string)
 }
 
 func (c *Connection) SetPingInterval(d time.Duration) { c.pingInterval = d }
@@ -110,6 +111,7 @@ func (c *Connection) OnDisconnect(fn func(reason string))                  { c.o
 func (c *Connection) OnConnected(fn func(pace protocol.PaceConfig))        { c.onConnected = fn }
 func (c *Connection) OnDEKRotated(fn func(newEpoch int))                   { c.onDEKRotated = fn }
 func (c *Connection) OnPathsPreview(fn func(protocol.PathsPreviewRequest)) { c.onPathsPreview = fn }
+func (c *Connection) OnUpdateAvailable(fn func(version string))             { c.onUpdateAvailable = fn }
 
 // IsConnected returns whether the WebSocket is currently connected.
 func (c *Connection) IsConnected() bool {
@@ -430,6 +432,12 @@ func (c *Connection) handleMessage(data []byte) {
 		var msg protocol.PathsPreviewRequest
 		if json.Unmarshal(data, &msg) == nil && c.onPathsPreview != nil {
 			go c.onPathsPreview(msg)
+		}
+
+	case "update_available":
+		var msg protocol.UpdateAvailableMessage
+		if json.Unmarshal(data, &msg) == nil && c.onUpdateAvailable != nil {
+			go c.onUpdateAvailable(msg.Version)
 		}
 
 	default:
