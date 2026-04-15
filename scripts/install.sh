@@ -349,6 +349,8 @@ VERSION="${1:?Usage: upgrade.sh VERSION}"
 if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     echo "Invalid version: $VERSION" >&2; exit 1
 fi
+# Clean up any previous upgrade unit (failed or completed)
+systemctl reset-failed blindwatch-upgrade 2>/dev/null || true
 # Run in a transient systemd unit so the upgrade survives the agent service being stopped.
 # Without this, systemd kills all processes in the agent's cgroup (including our children)
 # when the install script runs "systemctl stop blindwatch-agent".
