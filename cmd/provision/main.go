@@ -26,6 +26,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/watchblind/agent/internal/crypto"
@@ -138,7 +139,7 @@ func main() {
 		"api_url":             *apiURL,
 	}
 	provJSON, _ := json.MarshalIndent(provFile, "", "  ")
-	provPath := fmt.Sprintf("/tmp/blindwatch-provision-%s.json", agentID)
+	provPath := filepath.Join(os.TempDir(), fmt.Sprintf("blindwatch-provision-%s.json", agentID))
 	if err := os.WriteFile(provPath, provJSON, 0600); err != nil {
 		log.Printf("warning: could not write provision file: %v", err)
 	} else {

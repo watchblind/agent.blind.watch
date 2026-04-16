@@ -9,10 +9,8 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/watchblind/agent/internal/alert"
@@ -39,7 +37,10 @@ var (
 	date    = "unknown"
 )
 
-func main() {
+// runAgent runs the agent until stopCh is closed. It is invoked by the
+// platform-specific entry point in entry.go (console mode + signal handling)
+// and by the Windows SCM handler in service_windows.go (service mode).
+func runAgent(stopCh <-chan struct{}) {
 	// --- Memory and security limits ---
 	debug.SetMemoryLimit(50 * 1024 * 1024) // 50 MB GOMEMLIMIT per spec
 	// Core dump disabling is in security_linux.go (build-tagged)
@@ -196,10 +197,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Handle signals — zero DEK-related memory on exit
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	// Build WebSocket URL
 	wsURL := buildWSURL(apiURL) + "/v1/agent/stream"
@@ -493,9 +490,9 @@ func main() {
 			}
 		}()
 
-		fmt.Printf("\nAgent running (WebSocket mode). Press Ctrl+C to stop.\n")
+		fmt.Printf("\nAgent running (WebSocket mode).\n")
 		fmt.Printf("  WAL entries: %d pending\n", w.Count())
-		<-sigCh
+		<-stopCh
 		fmt.Println("\nShutting down gracefully...")
 		cancel()
 
