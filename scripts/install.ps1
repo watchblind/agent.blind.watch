@@ -1,4 +1,8 @@
-#Requires -RunAsAdministrator
+<#
+NOTE: #Requires -RunAsAdministrator is intentionally NOT used here because it
+is ignored when the script is piped through Invoke-Expression (irm | iex).
+Admin privileges are checked at runtime below, with auto-elevation fallback.
+#>
 <#
 .SYNOPSIS
     blind.watch agent installer for Windows.
@@ -42,6 +46,41 @@ $Platform = "windows_amd64"
 if (-not $Token) { $Token = $env:BW_TOKEN }
 if (-not $Secret) { $Secret = $env:BW_SECRET }
 if ($env:BW_API_URL) { $ApiUrl = $env:BW_API_URL }
+
+# --- Admin check + auto-elevation ---
+# #Requires -RunAsAdministrator doesn't work with `irm | iex`, so we check
+# at runtime. If not admin, re-launch elevated with all parameters preserved.
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "[info]  Administrator privileges required — requesting elevation via UAC..." -ForegroundColor Blue
+
+    # Save script to temp file so it can be invoked as -File with named params
+    $tmpScript = Join-Path $env:TEMP "blindwatch-install-$(Get-Random).ps1"
+    try {
+        Invoke-WebRequest -Uri "https://get.blind.watch/agent/windows" -OutFile $tmpScript -UseBasicParsing
+    } catch {
+        Write-Host "[error] Could not download installer for elevation: $_" -ForegroundColor Red
+        exit 1
+    }
+
+    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$tmpScript`"")
+    if ($Token)   { $argList += @("-Token",   $Token) }
+    if ($Secret)  { $argList += @("-Secret",  $Secret) }
+    if ($ApiUrl -ne "https://api.blind.watch") { $argList += @("-ApiUrl", $ApiUrl) }
+    if ($Upgrade) { $argList += "-Upgrade" }
+    if ($Version) { $argList += @("-Version", $Version) }
+    if ($DataDir -ne "C:\ProgramData\blindwatch") { $argList += @("-DataDir", "`"$DataDir`"") }
+
+    try {
+        Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -Wait
+    } catch {
+        Write-Host "[error] Elevation cancelled or failed. Please run from an elevated PowerShell prompt." -ForegroundColor Red
+        Remove-Item $tmpScript -ErrorAction SilentlyContinue
+        exit 1
+    }
+    Remove-Item $tmpScript -ErrorAction SilentlyContinue
+    exit
+}
 
 # --- Helpers ---
 function Write-Info  { param([string]$Msg) Write-Host "[info]  $Msg" -ForegroundColor Blue }
