@@ -150,6 +150,18 @@ type UpdateStatusMessage struct {
 	Error  *string `json:"error,omitempty"`
 }
 
+// --- Re-provisioning ---
+
+// ProvisionRevokedMessage is sent by the server when the agent's credentials
+// have been invalidated (re-provisioned or deleted from the dashboard).
+// On receipt the agent should shut down gracefully — any reconnect will fail
+// auth since the token has already been deleted.
+// See docs/components/agent-lifecycle.md §8.4 in the blind.watch repo.
+type ProvisionRevokedMessage struct {
+	Type   string `json:"type"`   // "provision_revoked"
+	Reason string `json:"reason"` // "reprovisioned" | "deleted"
+}
+
 // Envelope is used for initial JSON parsing to determine message type.
 type Envelope struct {
 	Type string `json:"type"`

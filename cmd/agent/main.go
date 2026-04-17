@@ -328,6 +328,14 @@ func runAgent(stopCh <-chan struct{}) {
 		go updater.TriggerUpdate(conn, targetVersion)
 	})
 
+	// Dashboard-triggered re-provisioning (or deletion) — credentials
+	// invalidated. Any reconnect will 401, so exit gracefully; the operator
+	// will reinstall with the new one-liner on the replacement host.
+	conn.OnProvisionRevoked(func(reason string) {
+		log.Printf("[agent] provisioning revoked (%s): shutting down", reason)
+		cancel()
+	})
+
 	// DEK rotation — server pushes new epoch, agent fetches and swaps
 	conn.OnDEKRotated(func(newEpoch int) {
 		log.Printf("[agent] DEK rotation event: new epoch %d", newEpoch)

@@ -63,6 +63,7 @@ type Connection struct {
 	onDEKRotated       func(newEpoch int)
 	onPathsPreview     func(req protocol.PathsPreviewRequest)
 	onUpdateAvailable  func(version string)
+	onProvisionRevoked func(reason string)
 }
 
 func (c *Connection) SetPingInterval(d time.Duration) { c.pingInterval = d }
@@ -112,6 +113,7 @@ func (c *Connection) OnConnected(fn func(pace protocol.PaceConfig))        { c.o
 func (c *Connection) OnDEKRotated(fn func(newEpoch int))                   { c.onDEKRotated = fn }
 func (c *Connection) OnPathsPreview(fn func(protocol.PathsPreviewRequest)) { c.onPathsPreview = fn }
 func (c *Connection) OnUpdateAvailable(fn func(version string))             { c.onUpdateAvailable = fn }
+func (c *Connection) OnProvisionRevoked(fn func(reason string))             { c.onProvisionRevoked = fn }
 
 // IsConnected returns whether the WebSocket is currently connected.
 func (c *Connection) IsConnected() bool {
@@ -438,6 +440,12 @@ func (c *Connection) handleMessage(data []byte) {
 		var msg protocol.UpdateAvailableMessage
 		if json.Unmarshal(data, &msg) == nil && c.onUpdateAvailable != nil {
 			go c.onUpdateAvailable(msg.Version)
+		}
+
+	case "provision_revoked":
+		var msg protocol.ProvisionRevokedMessage
+		if json.Unmarshal(data, &msg) == nil && c.onProvisionRevoked != nil {
+			c.onProvisionRevoked(msg.Reason)
 		}
 
 	default:
