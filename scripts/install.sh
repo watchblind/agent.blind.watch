@@ -260,18 +260,15 @@ create_data_dir() {
 }
 
 # --- Install systemd unit (requires root) ---
+#
+# Self-update runs in a separate oneshot unit (see install_upgrade_unit), so
+# the agent process itself never needs to shell out to sudo. That lets us
+# keep every Protect* directive AND NoNewPrivileges=yes on the agent, which
+# several of the Protect* options imply anyway (ProtectSystem=strict,
+# ProtectHome=yes, ProtectKernelTunables=yes, ProtectKernelModules=yes each
+# force NoNewPrivileges=yes on the agent's processes regardless of what the
+# explicit property says).
 install_systemd() {
-    if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] && [[ "$UPGRADE" == true ]]; then
-        # Patch out directives that block self-update via sudo
-        local svc="/etc/systemd/system/${SERVICE_NAME}.service"
-        if grep -q "NoNewPrivileges=yes" "$svc" 2>/dev/null; then
-            info "Patching systemd unit: removing NoNewPrivileges (required for self-update)..."
-            as_root sed -i '/^NoNewPrivileges=yes$/d; /^RestrictSUIDSGID=yes$/d' "$svc"
-            as_root systemctl daemon-reload
-        fi
-        return
-    fi
-
     info "Installing systemd unit..."
     as_root tee "/etc/systemd/system/${SERVICE_NAME}.service" > /dev/null << UNIT
 [Unit]
@@ -291,6 +288,8 @@ WatchdogSec=300
 
 # Security hardening
 LimitCORE=0
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=${DATA_DIR}
@@ -308,8 +307,6 @@ DeviceAllow=char-nvidia-modeset rw
 DeviceAllow=char-nvidia-uvm rw
 DeviceAllow=char-nvidia-caps r
 DeviceAllow=char-nvidia-frontend rw
-# NoNewPrivileges and RestrictSUIDSGID are omitted — agent needs sudo for self-update
-# (scoped sudoers entry limits it to /usr/local/lib/blindwatch/upgrade.sh only)
 # MemoryDenyWriteExecute=yes is omitted — Go runtime requires W+X memory
 
 [Install]
@@ -318,6 +315,63 @@ UNIT
 
     as_root systemctl daemon-reload
     ok "Systemd unit installed"
+}
+
+# --- Install the templated upgrade oneshot unit (requires root) ---
+#
+# The agent triggers self-update by asking systemd to start an instance of
+# this template (e.g. blindwatch-upgrade@v0.5.2.service). systemd launches
+# it as root in its own cgroup, outside the agent's NoNewPrivileges scope,
+# so the install script can legitimately use sudo-like elevation.
+install_upgrade_unit() {
+    info "Installing upgrade oneshot unit..."
+    as_root tee "/etc/systemd/system/blindwatch-upgrade@.service" > /dev/null << UPGRADE_UNIT
+[Unit]
+Description=blind.watch agent self-update to %i
+Documentation=https://github.com/${REPO}
+
+[Service]
+Type=oneshot
+# %I is the unescaped instance name (the version string). The helper
+# validates the value before doing anything, so it is safe to pass through.
+ExecStart=/usr/local/lib/blindwatch/upgrade.sh %I
+# Let systemd forget failed runs instead of blocking the next start.
+RemainAfterExit=no
+UPGRADE_UNIT
+    as_root systemctl daemon-reload
+    ok "Upgrade unit installed"
+}
+
+# --- Install polkit rule granting the agent targeted start permission ---
+#
+# Without this, systemctl start from the unprivileged blindwatch user goes
+# through D-Bus and hits org.freedesktop.systemd1.manage-units — which
+# requires polkit authorization. The rule is scoped to the upgrade template
+# only so the agent cannot manage anything else.
+install_polkit_rule() {
+    if ! command -v pkaction &>/dev/null && [[ ! -d /etc/polkit-1/rules.d ]]; then
+        warn "polkit not detected — dashboard-triggered updates will fail on this host."
+        warn "Install 'polkit' (or 'polkitd') and re-run this installer to enable self-update."
+        return
+    fi
+    info "Installing polkit rule for agent-triggered updates..."
+    as_root mkdir -p /etc/polkit-1/rules.d
+    as_root tee /etc/polkit-1/rules.d/10-blindwatch-upgrade.rules > /dev/null << POLKIT
+// Allow the blindwatch service user to start / stop / reset-failed the
+// self-update oneshot template. Scoped tightly so the account cannot
+// manage any other systemd unit.
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") return;
+    if (subject.user !== "${SERVICE_USER}") return;
+    var unit = action.lookup("unit");
+    if (!unit) return;
+    if (/^blindwatch-upgrade@.+\\.service$/.test(unit)) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+    as_root chmod 0644 /etc/polkit-1/rules.d/10-blindwatch-upgrade.rules
+    ok "Polkit rule installed"
 }
 
 # --- First boot provisioning (requires root for sudo -u) ---
@@ -346,7 +400,12 @@ run_first_boot() {
     ok "Provisioning complete"
 }
 
-# --- Install upgrade helper + sudoers entry (requires root) ---
+# --- Install upgrade helper script (requires root) ---
+#
+# The helper is the ExecStart of the blindwatch-upgrade@.service template.
+# It runs as root in a fresh cgroup, so there is no need for sudo or for
+# systemd-run — the oneshot unit already provides the cgroup isolation that
+# lets the upgrade survive `systemctl stop blindwatch-agent`.
 install_upgrade_helper() {
     info "Installing upgrade helper..."
     as_root mkdir -p /usr/local/lib/blindwatch
@@ -354,25 +413,21 @@ install_upgrade_helper() {
 #!/bin/bash
 set -euo pipefail
 VERSION="${1:?Usage: upgrade.sh VERSION}"
-# Validate version format (vX.Y.Z or X.Y.Z)
+# Validate version format (vX.Y.Z or X.Y.Z). Defence in depth: the Go agent
+# already enforces this, but the helper is reachable by anything root can run.
 if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     echo "Invalid version: $VERSION" >&2; exit 1
 fi
-# Clean up any previous upgrade unit (failed or completed)
-systemctl reset-failed blindwatch-upgrade 2>/dev/null || true
-# Run in a transient systemd unit so the upgrade survives the agent service being stopped.
-# Without this, systemd kills all processes in the agent's cgroup (including our children)
-# when the install script runs "systemctl stop blindwatch-agent".
-systemd-run --unit=blindwatch-upgrade --description="blind.watch agent upgrade" \
-    bash -c 'curl -sSL https://get.blind.watch/agent | bash -s -- --upgrade --version "'"$VERSION"'"'
+curl -sSL https://get.blind.watch/agent | bash -s -- --upgrade --version "$VERSION"
 UPGRADE
     as_root chmod 0755 /usr/local/lib/blindwatch/upgrade.sh
 
-    # Sudoers entry — scoped to upgrade script only
-    as_root tee /etc/sudoers.d/blindwatch > /dev/null << SUDOERS
-${SERVICE_USER} ALL=(root) NOPASSWD: /usr/local/lib/blindwatch/upgrade.sh
-SUDOERS
-    as_root chmod 0440 /etc/sudoers.d/blindwatch
+    # Clear out the legacy sudoers entry from the pre-polkit design; it is
+    # no longer needed and leaving it behind widens the privilege surface.
+    if [[ -f /etc/sudoers.d/blindwatch ]]; then
+        info "Removing legacy sudoers entry (superseded by polkit rule)..."
+        as_root rm -f /etc/sudoers.d/blindwatch
+    fi
     ok "Upgrade helper installed"
 }
 
@@ -416,7 +471,8 @@ main() {
     create_user
     create_data_dir
     install_systemd
-
+    install_upgrade_unit
+    install_polkit_rule
     install_upgrade_helper
 
     if [[ "$UPGRADE" == false ]]; then
