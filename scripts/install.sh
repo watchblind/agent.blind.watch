@@ -295,10 +295,19 @@ ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=${DATA_DIR}
 PrivateTmp=yes
-PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+# Device allowlist: the GPU collector needs /dev/nvidia* to run nvidia-smi.
+# PrivateDevices=yes would block these, so we use DevicePolicy=closed plus
+# explicit DeviceAllow rules. Non-NVIDIA hosts tolerate the missing subsystems.
+DevicePolicy=closed
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidiactl rw
+DeviceAllow=char-nvidia-modeset rw
+DeviceAllow=char-nvidia-uvm rw
+DeviceAllow=char-nvidia-caps r
+DeviceAllow=char-nvidia-frontend rw
 # NoNewPrivileges and RestrictSUIDSGID are omitted — agent needs sudo for self-update
 # (scoped sudoers entry limits it to /usr/local/lib/blindwatch/upgrade.sh only)
 # MemoryDenyWriteExecute=yes is omitted — Go runtime requires W+X memory

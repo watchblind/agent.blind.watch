@@ -12,18 +12,45 @@ import (
 	"time"
 )
 
-// nvidiaSMIPath is the absolute path to nvidia-smi.
-// Using an absolute path prevents PATH-based binary substitution.
-var nvidiaSMIPath = func() string {
+// nvidiaSMICandidates lists absolute paths to probe for nvidia-smi before
+// falling back to a PATH lookup. Absolute paths are preferred to avoid
+// PATH-based binary substitution; PATH is only consulted as a last resort.
+var nvidiaSMICandidates = func() []string {
 	if runtime.GOOS == "windows" {
-		return `C:\Windows\System32\nvidia-smi.exe`
+		return []string{
+			// Modern drivers (R450+) drop nvidia-smi in System32.
+			`C:\Windows\System32\nvidia-smi.exe`,
+			// Older / non-DCH drivers keep it under Program Files.
+			`C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe`,
+		}
 	}
-	return "/usr/bin/nvidia-smi"
+	return []string{
+		"/usr/bin/nvidia-smi",
+		"/usr/local/bin/nvidia-smi",
+		// NixOS exposes system binaries here.
+		"/run/current-system/sw/bin/nvidia-smi",
+	}
 }()
 
+func findNvidiaSMI() string {
+	for _, p := range nvidiaSMICandidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	bin := "nvidia-smi"
+	if runtime.GOOS == "windows" {
+		bin = "nvidia-smi.exe"
+	}
+	if p, err := exec.LookPath(bin); err == nil {
+		return p
+	}
+	return ""
+}
+
 type GPUCollector struct {
-	available bool
-	checked   bool
+	smiPath string
+	checked bool
 }
 
 func NewGPUCollector() *GPUCollector {
@@ -62,14 +89,13 @@ type nvGPUTemp struct {
 func (c *GPUCollector) Collect(ctx context.Context) ([]Metric, error) {
 	if !c.checked {
 		c.checked = true
-		_, err := os.Stat(nvidiaSMIPath)
-		c.available = err == nil
+		c.smiPath = findNvidiaSMI()
 	}
-	if !c.available {
+	if c.smiPath == "" {
 		return nil, nil
 	}
 
-	cmd := exec.CommandContext(ctx, nvidiaSMIPath, "-q", "-x")
+	cmd := exec.CommandContext(ctx, c.smiPath, "-q", "-x")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("nvidia-smi: %w", err)
