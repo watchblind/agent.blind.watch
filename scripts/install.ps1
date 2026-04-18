@@ -85,6 +85,30 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Content, $enc)
 }
 
+# Normalize a path to an absolute form with no trailing separator.
+# Win32 error 123 ("filename, directory name, or volume label syntax is
+# incorrect") is most often triggered when a quoted path with a trailing
+# backslash is embedded in a command line: CommandLineToArgvW parses the
+# `\"` as an escaped quote, the closing quote is lost, and SCM/Start-Process
+# rejects the rest of the line. Normalizing here means every downstream
+# consumer (UAC elevation, New-Service BinaryPathName, the agent CLI) gets
+# a string that is safe to wrap in quotes.
+function Resolve-CleanPath {
+    param([string]$Path)
+    if (-not $Path) { return $Path }
+    if ($Path.Contains('"')) {
+        Write-Fatal "Path contains an embedded double-quote, which is not supported: $Path"
+    }
+    try {
+        $abs = [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        Write-Fatal "Invalid path: ${Path} ($_)"
+    }
+    # Trim trailing separators but preserve a bare drive root like "C:\".
+    if ($abs.Length -gt 3) { $abs = $abs.TrimEnd('\', '/') }
+    return $abs
+}
+
 # Write a transient provision JSON file readable only by the current user
 # (and Administrators / SYSTEM by inheritance). Returns the file path.
 function New-TransientProvisionFile {
@@ -121,6 +145,16 @@ function New-TransientProvisionFile {
 
     return $path
 }
+
+# --- Normalize all path inputs ---
+# Done here (after helpers, before elevation) so the elevated child receives
+# already-clean paths and the SCM BinaryPathName built later cannot collapse
+# on a stray trailing backslash. Hardcoded constants are normalized too so a
+# future edit can't reintroduce the hazard.
+$DataDir    = Resolve-CleanPath $DataDir
+$InstallDir = Resolve-CleanPath $InstallDir
+if ($LocalBinary)    { $LocalBinary    = Resolve-CleanPath $LocalBinary }
+if ($ProvisionFile)  { $ProvisionFile  = Resolve-CleanPath $ProvisionFile }
 
 # --- Admin check + auto-elevation ---
 # #Requires -RunAsAdministrator doesn't work with `irm | iex`, so we check
@@ -363,6 +397,14 @@ Invoke-Expression "& { $script } -Upgrade -Version $Version"
 
 # --- Show recent service diagnostics on failure ---
 function Show-ServiceDiagnostics {
+    Write-Warn "Registered service command line:"
+    try {
+        $reg = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName" -ErrorAction Stop
+        Write-Host "    $($reg.ImagePath)"
+    } catch {
+        Write-Host "    (could not read registry: $_)"
+    }
+
     Write-Warn "Recent agent.log tail:"
     $logPath = Join-Path $DataDir "agent.log"
     if (Test-Path $logPath) {
@@ -385,7 +427,14 @@ function Show-ServiceDiagnostics {
 # --- Start service ---
 function Start-AgentService {
     Write-Info "Starting $ServiceName..."
-    Start-Service -Name $ServiceName -ErrorAction Stop
+    try {
+        Start-Service -Name $ServiceName -ErrorAction Stop
+    } catch {
+        $msg = $_.Exception.Message
+        Write-Warn "Start-Service failed: $msg"
+        Show-ServiceDiagnostics
+        Write-Fatal "Could not start ${ServiceName}. See diagnostics above."
+    }
 
     # Poll for up to 15s — Windows SCM start can take several seconds even when healthy.
     $deadline = (Get-Date).AddSeconds(15)
