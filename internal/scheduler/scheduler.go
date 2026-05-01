@@ -481,6 +481,15 @@ func (s *Scheduler) sendLive(snap *Snapshot) {
 	})
 }
 
+// FlushNow finalizes the in-progress OpenBatch and sends it synchronously.
+// Safe to call from any goroutine — openMu serializes it with the runLoop's
+// own bufferSnapshot/sendBatch path. Used by the update flow so the partial
+// batch built up since the last 10-minute boundary is not lost when the
+// upgrade unit restarts the agent.
+func (s *Scheduler) FlushNow() {
+	s.flush()
+}
+
 // flush finalizes the in-progress OpenBatch and sends a flush message.
 // Called on graceful shutdown. Uses SendSync since the process is shutting down.
 func (s *Scheduler) flush() {

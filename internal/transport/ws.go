@@ -213,6 +213,26 @@ func (c *Connection) SendSync(msg interface{}) error {
 	}
 }
 
+// Drain blocks until the send buffer is empty or the timeout elapses. Used by
+// the update flow so we know the syncing/downloading status frames + the final
+// metric/log batches have actually been pushed to the wire before the upgrade
+// unit kills the agent. A short final sleep gives writePump's last
+// in-progress WriteMessage a chance to land.
+func (c *Connection) Drain(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(c.sendCh) == 0 {
+			time.Sleep(100 * time.Millisecond)
+			return
+		}
+		select {
+		case <-c.stopCh:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // extractCategory peeks at the "type" field in a JSON message to determine its rate-limit category.
 func extractCategory(data []byte) string {
 	var env struct {

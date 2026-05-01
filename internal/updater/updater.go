@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/watchblind/agent/internal/transport"
 )
 
 const stableEndpoint = "https://get.blind.watch/agent/version/stable"
@@ -22,8 +20,11 @@ type versionResponse struct {
 }
 
 // StartAutoUpdatePoller checks get.blind.watch/agent/version/stable once per
-// hour and triggers an update if a newer version is available.
-func StartAutoUpdatePoller(ctx context.Context, conn *transport.Connection, currentVersion string) {
+// hour and invokes runUpdate when a newer version is available. runUpdate is
+// expected to handle the syncing → flush → TriggerUpdate sequence so the
+// auto-update path matches dashboard-triggered updates and does not lose the
+// last partial batch.
+func StartAutoUpdatePoller(ctx context.Context, currentVersion string, runUpdate func(version string)) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
@@ -44,7 +45,7 @@ func StartAutoUpdatePoller(ctx context.Context, conn *transport.Connection, curr
 			}
 			if compareVersions(ver, currentVersion) > 0 {
 				log.Printf("[updater] auto-update: %s -> %s", currentVersion, ver)
-				TriggerUpdate(conn, ver)
+				runUpdate(ver)
 				return // update restarts the process
 			}
 		}

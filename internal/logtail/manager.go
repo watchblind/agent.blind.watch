@@ -90,12 +90,21 @@ func NewManager(
 	}, nil
 }
 
-// FlushNow triggers an immediate flush of any buffered partial batch.
+// FlushNow triggers an immediate flush of any buffered partial batch. Async:
+// the actual flush happens on the Run loop's flushCh case.
 func (m *Manager) FlushNow() {
 	select {
 	case m.flushCh <- struct{}{}:
 	default:
 	}
+}
+
+// FlushAndWait synchronously finalises and sends the in-progress log batch.
+// Unlike FlushNow this returns once the send has been queued, so the update
+// flow can pair it with conn.Drain to know the data is actually on the wire
+// before the upgrade unit restarts the agent.
+func (m *Manager) FlushAndWait() {
+	m.flushOpenBatch()
 }
 
 // SetLive enables or disables live log forwarding.

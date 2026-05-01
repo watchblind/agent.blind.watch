@@ -233,6 +233,10 @@ func runAgent(stopCh <-chan struct{}) {
 	// Auto-update poller context — cancelled and recreated on config change
 	var autoUpdateCancel context.CancelFunc
 
+	// Forward declaration so OnConfig (which spawns the auto-update poller)
+	// and OnUpdateAvailable can both invoke the same flush+trigger flow.
+	var runUpdate func(targetVersion string)
+
 	// Config push from server — decrypt E2E encrypted config, then apply
 	conn.OnConfig(func(encConfig string) {
 		log.Printf("[agent] received encrypted config (%d bytes)", len(encConfig))
@@ -290,7 +294,7 @@ func runAgent(stopCh <-chan struct{}) {
 			if *cfg.AutoUpdate {
 				autoCtx, cancelFn := context.WithCancel(ctx)
 				autoUpdateCancel = cancelFn
-				go updater.StartAutoUpdatePoller(autoCtx, conn, version)
+				go updater.StartAutoUpdatePoller(autoCtx, version, runUpdate)
 				log.Printf("[agent] auto-update enabled")
 			} else {
 				log.Printf("[agent] auto-update disabled")
@@ -322,10 +326,25 @@ func runAgent(stopCh <-chan struct{}) {
 		log.Printf("[agent] disconnected by server: %s", reason)
 	})
 
-	// Dashboard-triggered update — run upgrade script in background
+	// runUpdate flushes everything we have buffered locally to the backend
+	// before handing off to the upgrade unit (which kills this process). The
+	// flush is bounded to a few seconds — a hung backend must not be able to
+	// block an update indefinitely. Shared between dashboard-triggered and
+	// auto-update paths so both report `syncing` and avoid a 10-minute gap.
+	runUpdate = func(targetVersion string) {
+		conn.Send(protocol.UpdateStatusMessage{
+			Type:   "update_status",
+			Status: "syncing",
+		})
+		sched.FlushNow()
+		logMgr.FlushAndWait()
+		conn.Drain(3 * time.Second)
+		updater.TriggerUpdate(conn, targetVersion)
+	}
+
 	conn.OnUpdateAvailable(func(targetVersion string) {
 		log.Printf("[agent] update requested: %s -> %s", version, targetVersion)
-		go updater.TriggerUpdate(conn, targetVersion)
+		go runUpdate(targetVersion)
 	})
 
 	// Dashboard-triggered re-provisioning (or deletion) — credentials
