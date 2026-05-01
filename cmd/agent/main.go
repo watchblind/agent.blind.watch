@@ -283,6 +283,17 @@ func runAgent(stopCh <-chan struct{}) {
 			log.Printf("[agent] updated %d log sources from server", len(cfg.LogSources))
 		}
 
+		// Push the user-chosen collection interval through to the scheduler
+		// so dashboard "Save & Push" actually re-paces sampling without
+		// waiting for a reconnect/connected message. SetPace expects ms;
+		// the wire format is seconds. SetPace also re-derives the live
+		// interval, so the second arg matches idle.
+		if cfg.Collection.IntervalSeconds > 0 {
+			ms := cfg.Collection.IntervalSeconds * 1000
+			sched.SetPace(ms, ms)
+			log.Printf("[agent] collection interval updated: %ds", cfg.Collection.IntervalSeconds)
+		}
+
 		// Manage auto-update poller based on config
 		if cfg.AutoUpdate != nil {
 			// Cancel existing poller if running
