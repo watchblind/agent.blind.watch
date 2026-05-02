@@ -295,6 +295,66 @@ done:
 	}
 }
 
+// Regression test for the "email every duration_seconds" spam bug. With a
+// configured recovery_seconds, a flapping metric must not re-emit firing
+// events on every dip below threshold — the incident should remain open
+// until the metric stays below threshold for a sustained recovery_seconds
+// window.
+func TestRecoveryDebounceSuppressesFlap(t *testing.T) {
+	rules := []config.AlertRule{{
+		ID:              "cpu_flap",
+		Name:            "Flappy CPU",
+		Type:            "metric",
+		Metric:          "cpu_percent",
+		Operator:        ">",
+		Threshold:       1.0,
+		DurationSeconds: 0, // fire on first breach
+		RecoverySeconds: 60,
+	}}
+
+	eval := NewEvaluator(rules)
+
+	// Initial fire.
+	eval.Evaluate(makeSnap(metric("cpu_percent", 5.0)))
+	eval.Evaluate(makeSnap(metric("cpu_percent", 5.0))) // second sample to fire
+	if ev := <-eval.Events(); ev.Type != "firing" {
+		t.Fatalf("expected initial firing event, got %s", ev.Type)
+	}
+
+	// Brief dip below threshold — should enter RecoveryPending, NOT recover.
+	eval.Evaluate(makeSnap(metric("cpu_percent", 0.5)))
+	state := eval.States().Get("cpu_flap")
+	if state.Status != StatusRecoveryPending {
+		t.Fatalf("expected RECOVERY_PENDING after first dip, got %v", state.Status)
+	}
+	select {
+	case ev := <-eval.Events():
+		t.Fatalf("did not expect any event on first dip, got %s", ev.Type)
+	default:
+	}
+
+	// Breach returns — should snap back to FIRING with no event.
+	eval.Evaluate(makeSnap(metric("cpu_percent", 5.0)))
+	state = eval.States().Get("cpu_flap")
+	if state.Status != StatusFiring {
+		t.Fatalf("expected FIRING after breach during debounce, got %v", state.Status)
+	}
+	select {
+	case ev := <-eval.Events():
+		t.Fatalf("did not expect any event when breach returns during debounce, got %s", ev.Type)
+	default:
+	}
+
+	// Another dip + immediate breach — still no flap notification.
+	eval.Evaluate(makeSnap(metric("cpu_percent", 0.5)))
+	eval.Evaluate(makeSnap(metric("cpu_percent", 5.0)))
+	select {
+	case ev := <-eval.Events():
+		t.Fatalf("flap loop must not emit events, got %s", ev.Type)
+	default:
+	}
+}
+
 func TestNoRulesNoEvents(t *testing.T) {
 	eval := NewEvaluator(nil)
 	eval.Evaluate(makeSnap(metric("cpu_percent", 99.0)))

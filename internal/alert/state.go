@@ -9,8 +9,9 @@ type AlertStatus int
 
 const (
 	StatusOK AlertStatus = iota
-	StatusPending
-	StatusFiring
+	StatusPending          // breaching, waiting for sustained duration before Firing
+	StatusFiring           // actively firing (one ongoing incident)
+	StatusRecoveryPending  // not breaching, waiting out the recovery window
 )
 
 func (s AlertStatus) String() string {
@@ -21,6 +22,8 @@ func (s AlertStatus) String() string {
 		return "PENDING"
 	case StatusFiring:
 		return "FIRING"
+	case StatusRecoveryPending:
+		return "RECOVERY_PENDING"
 	}
 	return "UNKNOWN"
 }
@@ -33,7 +36,11 @@ type AlertState struct {
 	Threshold      float64
 	FirstTriggered time.Time
 	FiredAt        time.Time
-	RecoveredAt    time.Time
+	// When recovery debouncing started — i.e. the moment value last dipped
+	// back below threshold while we were Firing. Only relevant in
+	// StatusRecoveryPending; cleared on transition to OK or back to Firing.
+	RecoveryStarted time.Time
+	RecoveredAt     time.Time
 }
 
 type StateTracker struct {

@@ -30,6 +30,12 @@ type AlertRule struct {
 	Operator        string   `toml:"operator" json:"operator"`
 	Threshold       float64  `toml:"threshold" json:"threshold"`
 	DurationSeconds int      `toml:"duration_seconds" json:"duration_seconds"`
+	// How long the metric has to stay below threshold before the rule
+	// recovers. Without this a single dip below threshold ends the
+	// incident and the next breach re-fires — flapping rules then spam
+	// notifications every duration_seconds. Defaults to DurationSeconds
+	// when 0 so existing rules don't change behaviour drastically.
+	RecoverySeconds int      `toml:"recovery_seconds" json:"recovery_seconds,omitempty"`
 	Channels        []string `toml:"channels" json:"channels"`
 }
 

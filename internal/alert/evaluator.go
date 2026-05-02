@@ -94,14 +94,27 @@ func (e *Evaluator) evaluateMetricRule(rule config.AlertRule, snap collector.Sna
 	state.CurrentValue = value
 	state.Threshold = rule.Threshold
 
+	// Default the recovery window to the firing window so a single rule
+	// edit still gives sensible hysteresis. Tests with DurationSeconds=0
+	// pass through here as recovery_seconds=0 → instant recovery, matching
+	// the old behaviour for that path.
+	recoverySeconds := rule.RecoverySeconds
+	if recoverySeconds <= 0 {
+		recoverySeconds = rule.DurationSeconds
+	}
+
+	// Five-state machine. Once Firing, brief dips below threshold start a
+	// recovery debounce instead of immediately ending the incident; only a
+	// sustained recovery (recoverySeconds without a single breach) emits
+	// "recovered" and lets the next breach fire a new incident. This is what
+	// stops flapping rules from spamming notifications every
+	// duration_seconds.
 	switch {
 	case breached && state.Status == StatusOK:
-		// Start pending
 		state.Status = StatusPending
 		state.FirstTriggered = now
 
 	case breached && state.Status == StatusPending:
-		// Check if duration met
 		if now.Sub(state.FirstTriggered) >= time.Duration(rule.DurationSeconds)*time.Second {
 			state.Status = StatusFiring
 			state.FiredAt = now
@@ -119,13 +132,55 @@ func (e *Evaluator) evaluateMetricRule(rule config.AlertRule, snap collector.Sna
 			})
 		}
 
-	case !breached && (state.Status == StatusFiring || state.Status == StatusPending):
-		// Recovered
-		prevStatus := state.Status
+	case breached && state.Status == StatusFiring:
+		// Steady-state firing — no event, no state change.
+
+	case breached && state.Status == StatusRecoveryPending:
+		// A breach during recovery debounce means the incident never
+		// actually recovered. Cancel debounce silently and stay Firing.
+		state.Status = StatusFiring
+		state.RecoveryStarted = time.Time{}
+
+	case !breached && state.Status == StatusPending:
+		// Hadn't fired yet — abort silently.
 		state.Status = StatusOK
-		state.RecoveredAt = now
 		state.FirstTriggered = time.Time{}
-		if prevStatus == StatusFiring {
+
+	case !breached && state.Status == StatusFiring:
+		if recoverySeconds <= 0 {
+			// No debounce configured — recover immediately. Preserves the
+			// old single-snapshot-recovery behaviour for rules with
+			// duration_seconds=0 (and the existing tests that rely on it).
+			state.Status = StatusOK
+			state.RecoveredAt = now
+			state.FirstTriggered = time.Time{}
+			state.RecoveryStarted = time.Time{}
+			e.emit(AlertEvent{
+				RuleID:          rule.ID,
+				RuleName:        rule.Name,
+				Type:            "recovered",
+				Metric:          rule.Metric,
+				Operator:        rule.Operator,
+				Threshold:       rule.Threshold,
+				Value:           value,
+				DurationSeconds: rule.DurationSeconds,
+				Message:         fmt.Sprintf("%s: recovered (%.1f)", rule.Name, value),
+				Time:            now,
+			})
+		} else {
+			// Start recovery debounce — do NOT emit yet. We only emit
+			// "recovered" once the metric has stayed below threshold for
+			// the full recovery_seconds window.
+			state.Status = StatusRecoveryPending
+			state.RecoveryStarted = now
+		}
+
+	case !breached && state.Status == StatusRecoveryPending:
+		if now.Sub(state.RecoveryStarted) >= time.Duration(recoverySeconds)*time.Second {
+			state.Status = StatusOK
+			state.RecoveredAt = now
+			state.FirstTriggered = time.Time{}
+			state.RecoveryStarted = time.Time{}
 			e.emit(AlertEvent{
 				RuleID:          rule.ID,
 				RuleName:        rule.Name,
