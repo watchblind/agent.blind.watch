@@ -8,6 +8,7 @@ import (
 
 	"github.com/watchblind/agent/internal/collector"
 	"github.com/watchblind/agent/internal/crypto"
+	"github.com/watchblind/agent/internal/protocol"
 	"github.com/watchblind/agent/internal/transport"
 	"github.com/watchblind/agent/internal/wal"
 )
@@ -85,6 +86,116 @@ func TestCrashMidWindow_RecoversAllSnapshots(t *testing.T) {
 	if len(walAfter) != 1 {
 		t.Errorf(".wal files after recovery = %d, want 1", len(walAfter))
 	}
+}
+
+// TestSyncWAL_EmitsOneEntryPerSnapshot guards the recovery → wal_sync wire
+// format: each snapshot the dead agent appended to the .open file must come
+// out the other side as a *separate* protocol.BatchEntry whose enc_payload is
+// the original encrypted snapshot ciphertext (never a JSON literal of the
+// payload array).
+//
+// Regression test for the v0.6.0 update incident where syncWAL serialised the
+// recovered batch as a single fake BatchEntry whose enc_payload was the
+// JSON-array string of all encrypted payloads. The dashboard then tried to
+// decrypt that string as ciphertext and saw an empty time series.
+func TestSyncWAL_EmitsOneEntryPerSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.New(dir, 10, 100)
+	if err != nil {
+		t.Fatalf("wal.New: %v", err)
+	}
+
+	// Build a scheduler and append four snapshots. Each Append fsyncs to the
+	// .open file under the hood.
+	s1 := newTestSchedulerWithWAL(t, w)
+	for _, ts := range []int64{1000, 1010, 1020, 1030} {
+		s1.bufferSnapshot(&Snapshot{Timestamp: ts})
+	}
+
+	// Capture the per-snapshot ciphertexts from the .open file BEFORE we
+	// "crash". This is what each recovered BatchEntry's enc_payload must
+	// match downstream — the dashboard decrypts these individually.
+	openFiles, _ := filepath.Glob(filepath.Join(dir, "*.open"))
+	if len(openFiles) != 1 {
+		t.Fatalf(".open files = %d, want 1", len(openFiles))
+	}
+	rawOpen, err := os.ReadFile(openFiles[0])
+	if err != nil {
+		t.Fatalf("read open file: %v", err)
+	}
+	var origCiphertexts []string
+	first := true
+	for _, line := range splitLines(rawOpen) {
+		if first { // skip meta line
+			first = false
+			continue
+		}
+		var rec struct {
+			EncPayload string `json:"enc_payload"`
+		}
+		if err := json.Unmarshal(line, &rec); err == nil && rec.EncPayload != "" {
+			origCiphertexts = append(origCiphertexts, rec.EncPayload)
+		}
+	}
+	if len(origCiphertexts) != 4 {
+		t.Fatalf("captured ciphertexts = %d, want 4", len(origCiphertexts))
+	}
+
+	// "Crash" — drop the scheduler reference WITHOUT calling flush.
+	_ = s1
+
+	// Fresh scheduler on the same dir, mirroring what main.go does on
+	// agent restart: New(...) → go sched.Run → Run calls syncWAL.
+	w2, err := wal.New(dir, 10, 100)
+	if err != nil {
+		t.Fatalf("wal.New (w2): %v", err)
+	}
+	s2 := newTestSchedulerWithWAL(t, w2)
+	s2.syncWAL()
+
+	// Drain whatever syncWAL queued onto the connection's send buffer. There
+	// must be exactly one wal_sync message with one BatchEntry per original
+	// snapshot, and each BatchEntry.enc_payload must equal the original.
+	var msgs []protocol.WALSyncMessage
+	for {
+		raw := s2.conn.PopPendingForTest()
+		if raw == nil {
+			break
+		}
+		var m protocol.WALSyncMessage
+		if err := json.Unmarshal(raw, &m); err == nil && m.Type == "wal_sync" {
+			msgs = append(msgs, m)
+		}
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("wal_sync messages = %d, want 1", len(msgs))
+	}
+	got := msgs[0]
+	if len(got.Entries) != 4 {
+		t.Fatalf("entries in wal_sync = %d, want 4 (one per snapshot)", len(got.Entries))
+	}
+	for i, entry := range got.Entries {
+		if entry.EncPayload != origCiphertexts[i] {
+			t.Errorf("entry[%d].enc_payload mismatch:\n  got  %q\n  want %q",
+				i, entry.EncPayload, origCiphertexts[i])
+		}
+	}
+}
+
+// splitLines splits buf on '\n', dropping any trailing empty line.
+func splitLines(buf []byte) [][]byte {
+	var out [][]byte
+	start := 0
+	for i, b := range buf {
+		if b == '\n' {
+			out = append(out, buf[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(buf) {
+		out = append(out, buf[start:])
+	}
+	return out
 }
 
 // TestCrashMidWindow_TornFinalLineDropped corrupts the last line of the .open

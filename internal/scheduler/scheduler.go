@@ -181,20 +181,7 @@ func (s *Scheduler) syncWAL() {
 	log.Printf("[scheduler] syncing %d WAL entries", len(entries))
 
 	for i, e := range entries {
-		// Each WAL entry is a full batch stored as JSON array of BatchEntry.
-		// Deserialize the entries to resend in proper format.
-		var batchEntries []protocol.BatchEntry
-		if plainEntries, err := deserializeWALEntries(e.EncPayload); err == nil {
-			batchEntries = plainEntries
-		} else {
-			// Legacy format: single encrypted payload per WAL entry.
-			// Wrap it as a single-entry batch for backward compatibility.
-			batchEntries = []protocol.BatchEntry{{
-				Epoch:      e.Epoch,
-				Timestamp:  e.Timestamp,
-				EncPayload: e.EncPayload,
-			}}
-		}
+		batchEntries := batchEntriesFromWAL(e)
 
 		if err := s.conn.Send(protocol.WALSyncMessage{
 			Type:    "wal_sync",
@@ -211,17 +198,48 @@ func (s *Scheduler) syncWAL() {
 	}
 }
 
-// deserializeWALEntries tries to parse a WAL payload as a JSON array of BatchEntry.
-// Returns error if it's not in the new batch format (legacy single-entry WAL).
-func deserializeWALEntries(payload string) ([]protocol.BatchEntry, error) {
-	var entries []protocol.BatchEntry
-	if err := json.Unmarshal([]byte(payload), &entries); err != nil {
-		return nil, err
+// batchEntriesFromWAL expands a recovered wal.Entry into a slice of
+// protocol.BatchEntry suitable for a wal_sync (or flush) message.
+//
+// OpenBatch.Finalize serialises an in-progress batch as `["enc1", "enc2", ...]`
+// — a JSON array of per-snapshot ciphertext strings. Each ciphertext must be
+// re-emitted as its OWN BatchEntry so the dashboard can decrypt them
+// individually; bundling them as a single fake BatchEntry with the JSON
+// literal as enc_payload was the bug that ate user data on the v0.6.0 update.
+//
+// We also still accept the legacy single-blob format (where EncPayload is one
+// ciphertext directly) so .wal files written by older code paths drain
+// cleanly.
+//
+// Per-snapshot timestamps are NOT preserved in the on-disk array-of-strings
+// format, so we stamp each entry as `meta.StartedAt + i*idleCollectInterval`,
+// matching what flush() emits for the live shutdown path. Worst case the
+// timestamps drift by one collect interval; better than the previous
+// behaviour of losing every snapshot.
+func batchEntriesFromWAL(e wal.Entry) []protocol.BatchEntry {
+	var payloads []string
+	if err := json.Unmarshal([]byte(e.EncPayload), &payloads); err == nil && len(payloads) > 0 {
+		entries := make([]protocol.BatchEntry, len(payloads))
+		stride := int64(idleCollectInterval / time.Second)
+		if stride <= 0 {
+			stride = 10
+		}
+		for j, p := range payloads {
+			entries[j] = protocol.BatchEntry{
+				Epoch:      e.Epoch,
+				Timestamp:  e.Timestamp + int64(j)*stride,
+				EncPayload: p,
+			}
+		}
+		return entries
 	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("empty entries array")
-	}
-	return entries, nil
+
+	// Legacy format: one ciphertext per .wal file.
+	return []protocol.BatchEntry{{
+		Epoch:      e.Epoch,
+		Timestamp:  e.Timestamp,
+		EncPayload: e.EncPayload,
+	}}
 }
 
 func (s *Scheduler) runLoop(ctx context.Context) {
@@ -512,20 +530,11 @@ func (s *Scheduler) flush() {
 		return
 	}
 
-	var payloads []string
-	_ = json.Unmarshal([]byte(entry.EncPayload), &payloads)
-	entries := make([]protocol.BatchEntry, len(payloads))
-	for i, p := range payloads {
-		entries[i] = protocol.BatchEntry{
-			Epoch: entry.Epoch, Timestamp: entry.Timestamp + int64(i*10), EncPayload: p,
-		}
-	}
-
 	if err := s.conn.SendSync(protocol.FlushMessage{
 		Type:    "flush",
 		BatchID: entry.BatchID,
 		Epoch:   entry.Epoch,
-		Entries: entries,
+		Entries: batchEntriesFromWAL(entry),
 	}); err != nil {
 		log.Printf("[scheduler] flush send error: %v (data in WAL)", err)
 	}

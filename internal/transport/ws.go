@@ -213,6 +213,19 @@ func (c *Connection) SendSync(msg interface{}) error {
 	}
 }
 
+// PopPendingForTest pops the next buffered outbound message and returns its
+// raw JSON bytes, or nil if none. Test-only — production code uses writePump
+// to drain sendCh; exposing the queue lets the scheduler/recovery tests
+// assert on what would have been sent without dialing the WS.
+func (c *Connection) PopPendingForTest() []byte {
+	select {
+	case item := <-c.sendCh:
+		return item.data
+	default:
+		return nil
+	}
+}
+
 // Drain blocks until the send buffer is empty or the timeout elapses. Used by
 // the update flow so we know the syncing/downloading status frames + the final
 // metric/log batches have actually been pushed to the wire before the upgrade
