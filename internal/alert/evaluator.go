@@ -46,11 +46,151 @@ func (e *Evaluator) States() *StateTracker {
 	return e.states
 }
 
-// UpdateRules replaces the alert rules at runtime (called when server pushes config).
+// UpdateRules replaces the alert rule set at runtime (called when the server
+// pushes a fresh config). It also reconciles the per-rule state tracker
+// against the new rules so an in-flight incident doesn't get into an
+// inconsistent state when the operator edits the rule mid-incident:
+//
+//   - Rule removed (disabled / deleted / moved off this agent) — if the
+//     previous state was Firing or RecoveryPending we emit a final
+//     "recovered" event so the dashboard's history closes the incident,
+//     then drop the state row.
+//   - Breach condition (metric or operator) changed — the old state is no
+//     longer comparable to the new question. Emit "recovered" for the old
+//     incident if it was Firing/RecoveryPending, then drop state so the
+//     new condition starts fresh from OK.
+//   - Threshold-only change — re-check the last observed value against the
+//     NEW threshold. If it still breaches, the incident continues
+//     uninterrupted (no event). If it no longer breaches we emit
+//     "recovered" immediately and skip the recovery debounce ("the user
+//     raised the bar to snooze the incident").
+//   - Anything else (name, channels, duration, recovery_seconds) — keep
+//     state as-is; the new timings apply on the next transition.
 func (e *Evaluator) UpdateRules(rules []config.AlertRule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	oldRules := indexRulesByID(e.rules)
+	newRules := indexRulesByID(rules)
 	e.rules = rules
+
+	now := time.Now()
+
+	// 1. Rules that disappeared from the new set — close their incidents.
+	for id, oldRule := range oldRules {
+		if _, exists := newRules[id]; exists {
+			continue
+		}
+		e.closeIncidentLocked(oldRule, now, "rule removed")
+		e.states.Delete(id)
+	}
+
+	// 2. Rules that survived — reconcile changes to breach condition or
+	//    threshold against the existing state.
+	for id, newRule := range newRules {
+		oldRule, existed := oldRules[id]
+		if !existed {
+			continue // new rule, no prior state to reconcile
+		}
+		conditionChanged := oldRule.Metric != newRule.Metric ||
+			oldRule.Operator != newRule.Operator
+		if conditionChanged {
+			e.closeIncidentLocked(oldRule, now, "rule condition changed")
+			e.states.Delete(id)
+			continue
+		}
+		if oldRule.Threshold != newRule.Threshold {
+			e.applyThresholdChangeLocked(oldRule, newRule, now)
+			continue
+		}
+		// Name / channels / durations only — nothing to do; the new
+		// duration_seconds and recovery_seconds will be picked up by the
+		// next evaluateMetricRule call.
+	}
+}
+
+// closeIncidentLocked emits a final "recovered" event for a rule that's
+// being torn down, but only if there was actually an open incident
+// (Firing / RecoveryPending) under the OLD definition. Caller must hold
+// e.mu.
+func (e *Evaluator) closeIncidentLocked(oldRule config.AlertRule, now time.Time, reason string) {
+	state := e.states.Get(oldRule.ID)
+	if state == nil {
+		return
+	}
+	if state.Status != StatusFiring && state.Status != StatusRecoveryPending {
+		return
+	}
+	e.emit(AlertEvent{
+		RuleID:          oldRule.ID,
+		RuleName:        oldRule.Name,
+		Type:            "recovered",
+		Metric:          oldRule.Metric,
+		Operator:        oldRule.Operator,
+		Threshold:       oldRule.Threshold,
+		Value:           state.CurrentValue,
+		DurationSeconds: oldRule.DurationSeconds,
+		Message:         fmt.Sprintf("%s: %s", oldRule.Name, reason),
+		Time:            now,
+	})
+}
+
+// applyThresholdChangeLocked re-evaluates the existing state against the
+// new threshold. If the last observed value still breaches we leave state
+// alone (the incident continues, just with a stricter/looser bar). If it
+// no longer breaches we close the incident immediately, bypassing the
+// recovery debounce — the operator explicitly raised the threshold,
+// there's nothing to debounce against. Caller must hold e.mu.
+func (e *Evaluator) applyThresholdChangeLocked(oldRule, newRule config.AlertRule, now time.Time) {
+	state := e.states.Get(newRule.ID)
+	if state == nil {
+		return
+	}
+	state.Threshold = newRule.Threshold
+
+	if state.Status != StatusFiring && state.Status != StatusRecoveryPending {
+		// Pending or OK — next evaluateMetricRule will reconcile naturally.
+		e.states.Set(newRule.ID, state)
+		return
+	}
+
+	stillBreached := checkThreshold(state.CurrentValue, newRule.Operator, newRule.Threshold)
+	if stillBreached {
+		// Incident continues under the new threshold. No event.
+		e.states.Set(newRule.ID, state)
+		return
+	}
+
+	state.Status = StatusOK
+	state.RecoveredAt = now
+	state.FirstTriggered = time.Time{}
+	state.RecoveryStarted = time.Time{}
+	e.states.Set(newRule.ID, state)
+
+	e.emit(AlertEvent{
+		RuleID:          newRule.ID,
+		RuleName:        newRule.Name,
+		Type:            "recovered",
+		Metric:          newRule.Metric,
+		Operator:        newRule.Operator,
+		Threshold:       newRule.Threshold,
+		Value:           state.CurrentValue,
+		DurationSeconds: newRule.DurationSeconds,
+		Message: fmt.Sprintf(
+			"%s: threshold raised to %.1f, recovered",
+			newRule.Name,
+			newRule.Threshold,
+		),
+		Time: now,
+	})
+}
+
+func indexRulesByID(rules []config.AlertRule) map[string]config.AlertRule {
+	out := make(map[string]config.AlertRule, len(rules))
+	for _, r := range rules {
+		out[r.ID] = r
+	}
+	return out
 }
 
 func (e *Evaluator) Evaluate(snap collector.Snapshot) {

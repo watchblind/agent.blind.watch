@@ -66,6 +66,15 @@ func (t *StateTracker) Set(ruleID string, state *AlertState) {
 	t.states[ruleID] = state
 }
 
+// Delete drops the tracked state for a rule. Used by UpdateRules when a rule
+// is removed or its breach condition changes — the existing state can no
+// longer be reasoned about under the new question.
+func (t *StateTracker) Delete(ruleID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.states, ruleID)
+}
+
 func (t *StateTracker) All() []*AlertState {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
