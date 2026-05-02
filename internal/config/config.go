@@ -23,14 +23,14 @@ type CollectionConfig struct {
 }
 
 type AlertRule struct {
-	ID              string   `toml:"id"`
-	Name            string   `toml:"name"`
-	Type            string   `toml:"type"`
-	Metric          string   `toml:"metric"`
-	Operator        string   `toml:"operator"`
-	Threshold       float64  `toml:"threshold"`
-	DurationSeconds int      `toml:"duration_seconds"`
-	Channels        []string `toml:"channels"`
+	ID              string   `toml:"id" json:"id"`
+	Name            string   `toml:"name" json:"name"`
+	Type            string   `toml:"type" json:"type"`
+	Metric          string   `toml:"metric" json:"metric"`
+	Operator        string   `toml:"operator" json:"operator"`
+	Threshold       float64  `toml:"threshold" json:"threshold"`
+	DurationSeconds int      `toml:"duration_seconds" json:"duration_seconds"`
+	Channels        []string `toml:"channels" json:"channels"`
 }
 
 type AlertsConfig struct {
