@@ -11,12 +11,16 @@ import (
 )
 
 type AlertEvent struct {
-	RuleID   string
-	RuleName string
-	Type     string // "firing" or "recovered"
-	Value    float64
-	Message  string
-	Time     time.Time
+	RuleID          string
+	RuleName        string
+	Type            string // "firing" or "recovered"
+	Metric          string
+	Operator        string
+	Threshold       float64
+	Value           float64
+	DurationSeconds int
+	Message         string
+	Time            time.Time
 }
 
 type Evaluator struct {
@@ -102,12 +106,16 @@ func (e *Evaluator) evaluateMetricRule(rule config.AlertRule, snap collector.Sna
 			state.Status = StatusFiring
 			state.FiredAt = now
 			e.emit(AlertEvent{
-				RuleID:   rule.ID,
-				RuleName: rule.Name,
-				Type:     "firing",
-				Value:    value,
-				Message:  fmt.Sprintf("%s: %.1f %s %.1f for %ds", rule.Name, value, rule.Operator, rule.Threshold, rule.DurationSeconds),
-				Time:     now,
+				RuleID:          rule.ID,
+				RuleName:        rule.Name,
+				Type:            "firing",
+				Metric:          rule.Metric,
+				Operator:        rule.Operator,
+				Threshold:       rule.Threshold,
+				Value:           value,
+				DurationSeconds: rule.DurationSeconds,
+				Message:         fmt.Sprintf("%s: %.1f %s %.1f for %ds", rule.Name, value, rule.Operator, rule.Threshold, rule.DurationSeconds),
+				Time:            now,
 			})
 		}
 
@@ -119,12 +127,16 @@ func (e *Evaluator) evaluateMetricRule(rule config.AlertRule, snap collector.Sna
 		state.FirstTriggered = time.Time{}
 		if prevStatus == StatusFiring {
 			e.emit(AlertEvent{
-				RuleID:   rule.ID,
-				RuleName: rule.Name,
-				Type:     "recovered",
-				Value:    value,
-				Message:  fmt.Sprintf("%s: recovered (%.1f)", rule.Name, value),
-				Time:     now,
+				RuleID:          rule.ID,
+				RuleName:        rule.Name,
+				Type:            "recovered",
+				Metric:          rule.Metric,
+				Operator:        rule.Operator,
+				Threshold:       rule.Threshold,
+				Value:           value,
+				DurationSeconds: rule.DurationSeconds,
+				Message:         fmt.Sprintf("%s: recovered (%.1f)", rule.Name, value),
+				Time:            now,
 			})
 		}
 	}

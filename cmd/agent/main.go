@@ -452,16 +452,29 @@ func runAgent(stopCh <-chan struct{}) {
 		}
 	}()
 
-	// Alert event forwarding over WebSocket
+	// Alert event forwarding over WebSocket. The notification payload is
+	// E2E encrypted with the agent's DEK — only the dashboard can decrypt
+	// it. Include enough structured detail (rule name, metric, operator,
+	// threshold, observed value, duration, agent hostname) for the
+	// dashboard's notification panel + alert history rows to render real
+	// names and values without leaking anything to the server.
 	go func() {
+		hostname, _ := os.Hostname()
 		for event := range eval.Events() {
 			fmt.Printf("[ALERT] %s: %s\n", event.Type, event.Message)
 
 			notifPayload, _ := json.Marshal(map[string]interface{}{
-				"rule_id":   event.RuleID,
-				"rule_name": event.RuleName,
-				"value":     event.Value,
-				"message":   event.Message,
+				"rule_id":          event.RuleID,
+				"rule_name":        event.RuleName,
+				"metric":           event.Metric,
+				"operator":         event.Operator,
+				"threshold":        event.Threshold,
+				"value":            event.Value,
+				"duration_seconds": event.DurationSeconds,
+				"agent_hostname":   hostname,
+				"triggered_at":     event.Time.Unix(),
+				"recovered":        event.Type == "recovered",
+				"message":          event.Message,
 			})
 
 			// Use current encryptor/epoch from scheduler (tracks DEK rotations)
