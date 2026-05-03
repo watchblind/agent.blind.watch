@@ -38,7 +38,55 @@ const (
 	idleCollectInterval = 10 * time.Second
 	liveCollectInterval = 1 * time.Second
 	batchInterval       = 10 * time.Minute
+
+	// retentionWindow controls how long the most recently sent batch is
+	// kept in memory so it can be re-emitted in a `replay` message when a
+	// dashboard viewer connects right after a 10-minute boundary. The
+	// window covers R2 LIST eventual consistency (the dashboard's initial
+	// LIST may not yet see the just-PUT batch object). After the window,
+	// the batch is guaranteed visible via R2 LIST and the retained copy
+	// can be discarded.
+	retentionWindow = 90 * time.Second
 )
+
+// lastSentBatch holds the most recently sent batch so it can be included
+// in a replay message until R2 LIST is guaranteed to surface it.
+type lastSentBatch struct {
+	mu      sync.Mutex
+	sentAt  time.Time
+	entries []protocol.BatchEntry
+}
+
+// record stores entries with the current wall-clock time. Older retained
+// data is overwritten.
+func (l *lastSentBatch) record(entries []protocol.BatchEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	l.mu.Lock()
+	l.sentAt = time.Now()
+	// Take a defensive copy so subsequent mutations to the caller's slice
+	// can't poison the retention buffer.
+	l.entries = append(l.entries[:0], entries...)
+	l.mu.Unlock()
+}
+
+// snapshot returns the retained entries if they are still within the
+// retention window; otherwise clears them and returns nil.
+func (l *lastSentBatch) snapshot() []protocol.BatchEntry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.entries == nil {
+		return nil
+	}
+	if time.Since(l.sentAt) > retentionWindow {
+		l.entries = nil
+		return nil
+	}
+	out := make([]protocol.BatchEntry, len(l.entries))
+	copy(out, l.entries)
+	return out
+}
 
 // Scheduler orchestrates metric collection, batching, encryption, and sending.
 //
@@ -67,6 +115,10 @@ type Scheduler struct {
 	openMu    sync.Mutex
 	openBatch *wal.OpenBatch
 	openID    string
+
+	// Most recently sent batch, retained for ~90s to bridge the gap
+	// between R2 PUT and R2 LIST eventual consistency on viewer connect.
+	lastSent lastSentBatch
 
 	// Channel to signal pace changes to the run loop.
 	paceChanged chan struct{}
@@ -427,45 +479,62 @@ func (s *Scheduler) sendBatch() {
 	}); err != nil {
 		log.Printf("[scheduler] batch send error: %v (data in WAL)", err)
 	} else {
+		// Retain a copy so a viewer connecting in the next ~90s can be
+		// served the just-sent batch via replay even before R2 LIST has
+		// propagated the new object.
+		s.lastSent.record(entries)
 		log.Printf("[scheduler] batch sent: %s (%d entries)", entry.BatchID, len(entries))
 	}
 }
 
-// sendReplay sends a "replay" message on live mode activation containing
-// the current in-progress batch data from the .open file on disk.
-// This fills the gap between the last R2-persisted batch and the start of live streaming.
+// sendReplay sends a "replay" message on live mode activation. The replay
+// covers the gap between "what the dashboard can already fetch from R2" and
+// "now," which has two sources:
+//
+//  1. The most recently SENT batch, retained for retentionWindow after the
+//     send. Bridges R2 LIST eventual consistency — the dashboard's initial
+//     LIST after page load may not yet see the just-PUT batch object.
+//  2. The current IN-PROGRESS batch (entries collected since the last
+//     10-minute boundary). These have not been sent yet, so they cannot be
+//     in R2; without replay the dashboard would show a hard cut at the
+//     last completed boundary.
+//
+// Entries are deduplicated downstream by timestamp on the dashboard side, so
+// it is safe to over-include here when the windows overlap.
 func (s *Scheduler) sendReplay() {
-	s.openMu.Lock()
-	ob := s.openBatch
-	openID := s.openID
-	s.openMu.Unlock()
-	if ob == nil {
-		return
-	}
-	path := filepath.Join(s.wal.Dir(), openID+".open")
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
+	// (1) Retained last-sent batch (if still within window).
+	entries := s.lastSent.snapshot()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	first := true
-	var entries []protocol.BatchEntry
-	for scanner.Scan() {
-		if first {
-			first = false
-			continue
+	// (2) In-progress entries from the .open file on disk. The file may
+	// not exist yet if no idle tick has fired since the last boundary —
+	// that's fine, we just send what we have.
+	s.openMu.Lock()
+	openID := s.openID
+	hasOpen := s.openBatch != nil
+	s.openMu.Unlock()
+	if hasOpen {
+		path := filepath.Join(s.wal.Dir(), openID+".open")
+		if f, err := os.Open(path); err == nil {
+			scanner := bufio.NewScanner(f)
+			scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+			first := true
+			for scanner.Scan() {
+				if first {
+					first = false
+					continue
+				}
+				var rec wal.EntryRecord
+				if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+					break
+				}
+				entries = append(entries, protocol.BatchEntry{
+					Epoch: rec.Epoch, Timestamp: rec.Timestamp, EncPayload: rec.EncPayload,
+				})
+			}
+			f.Close()
 		}
-		var rec wal.EntryRecord
-		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
-			break
-		}
-		entries = append(entries, protocol.BatchEntry{
-			Epoch: rec.Epoch, Timestamp: rec.Timestamp, EncPayload: rec.EncPayload,
-		})
 	}
+
 	if len(entries) == 0 {
 		return
 	}
