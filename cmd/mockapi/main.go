@@ -59,6 +59,7 @@ type Server struct {
 	viewers           map[string]*websocket.Conn    // viewer_id → ws
 	batches           []StoredBatch
 	provisionedAgents map[string]*ProvisionedAgent  // agent_id → provisioning data
+	pendingBrowse     map[string]chan protocol.BrowseResponse // request_id → waiter
 	liveMode          bool
 	messageLog        []string // for debugging
 
@@ -82,6 +83,7 @@ func NewServer() *Server {
 		agents:            make(map[string]*websocket.Conn),
 		viewers:           make(map[string]*websocket.Conn),
 		provisionedAgents: make(map[string]*ProvisionedAgent),
+		pendingBrowse:     make(map[string]chan protocol.BrowseResponse),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -185,6 +187,12 @@ func (s *Server) agentReadLoop(conn *websocket.Conn, meta AgentMeta) {
 			var msg protocol.AlertMessage
 			if json.Unmarshal(data, &msg) == nil {
 				s.handleAlert(meta, msg)
+			}
+
+		case "browse_response":
+			var msg protocol.BrowseResponse
+			if json.Unmarshal(data, &msg) == nil {
+				s.deliverBrowseResponse(msg)
 			}
 		}
 	}
@@ -432,6 +440,73 @@ func (s *Server) handlePushConfig(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[mockapi] pushed encrypted config to %d agents", len(agents))
 	w.Write([]byte(`{"status":"encrypted config pushed"}`))
+}
+
+// deliverBrowseResponse routes an agent browse_response to the relay request
+// waiting on its request_id, if any.
+func (s *Server) deliverBrowseResponse(msg protocol.BrowseResponse) {
+	s.mu.Lock()
+	ch, ok := s.pendingBrowse[msg.RequestID]
+	if ok {
+		delete(s.pendingBrowse, msg.RequestID)
+	}
+	s.mu.Unlock()
+
+	if ok {
+		ch <- msg // buffered, never blocks
+	} else {
+		log.Printf("[mockapi] unmatched browse_response: %s", msg.RequestID)
+	}
+}
+
+// handleBrowse relays an encrypted browse_request from the dashboard to a
+// connected agent and waits for the matching browse_response (spec
+// log-source-config.md section 8, Option A). The payload stays opaque —
+// the server never sees browsed paths or unit names.
+func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
+	agentID := r.PathValue("id")
+
+	var body struct {
+		RequestID  string `json:"request_id"`
+		EncPayload string `json:"enc_payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.RequestID == "" || body.EncPayload == "" {
+		http.Error(w, "request_id and enc_payload are required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	conn, ok := s.agents[agentID]
+	if !ok {
+		s.mu.Unlock()
+		http.Error(w, "agent not connected", http.StatusNotFound)
+		return
+	}
+	ch := make(chan protocol.BrowseResponse, 1)
+	s.pendingBrowse[body.RequestID] = ch
+	s.mu.Unlock()
+
+	sendJSON(conn, protocol.BrowseRequest{
+		Type:       "browse_request",
+		RequestID:  body.RequestID,
+		EncPayload: body.EncPayload,
+	})
+	log.Printf("[mockapi] relayed browse_request %s to %s", body.RequestID, agentID)
+
+	select {
+	case resp := <-ch:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"request_id":  resp.RequestID,
+			"enc_payload": resp.EncPayload,
+			"agent_id":    agentID,
+		})
+	case <-time.After(10 * time.Second):
+		s.mu.Lock()
+		delete(s.pendingBrowse, body.RequestID)
+		s.mu.Unlock()
+		http.Error(w, "browse timeout", http.StatusGatewayTimeout)
+	}
 }
 
 func (s *Server) handleMessageLog(w http.ResponseWriter, r *http.Request) {
@@ -716,6 +791,7 @@ func main() {
 
 	// Provisioning endpoints (spec: provisioning-protocol.md)
 	http.HandleFunc("/v1/agents", srv.handleCreateAgent)
+	http.HandleFunc("POST /v1/agents/{id}/browse", srv.handleBrowse)
 	http.HandleFunc("/v1/agent/whoami", srv.handleWhoami)
 	http.HandleFunc("/v1/agent/provision", srv.handleProvision)
 	http.HandleFunc("/v1/agent/dek", srv.handleUploadDEK)

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/watchblind/agent/internal/alert"
+	"github.com/watchblind/agent/internal/browse"
 	"github.com/watchblind/agent/internal/collector"
 	"github.com/watchblind/agent/internal/config"
 	"github.com/watchblind/agent/internal/crypto"
@@ -438,6 +439,31 @@ func runAgent(stopCh <-chan struct{}) {
 			RequestID:  req.RequestID,
 			Epoch:      epoch,
 			EncListing: encListing,
+		})
+	})
+
+	// Spec-compliant browse handling (log-source-config.md): the request
+	// payload arrives E2E encrypted so the server never sees browsed paths or
+	// unit names. The legacy paths_preview flow above stays for currently
+	// deployed dashboards. Concurrency (max 2) and the 5s work timeout are
+	// enforced inside the browse handler.
+	browseHandler := browse.NewHandler()
+	conn.OnBrowse(func(req protocol.BrowseRequest) {
+		currentEnc, currentEpoch := sched.EncryptorAndEpoch()
+		if currentEnc == nil {
+			log.Printf("[browse] no encryptor, dropping browse response")
+			return
+		}
+		encPayload, err := browseHandler.HandleEncrypted(req.EncPayload, currentEnc)
+		if err != nil {
+			log.Printf("[browse] encrypt error: %v", err)
+			return
+		}
+		_ = conn.Send(protocol.BrowseResponse{
+			Type:       "browse_response",
+			RequestID:  req.RequestID,
+			Epoch:      currentEpoch,
+			EncPayload: encPayload,
 		})
 	})
 

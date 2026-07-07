@@ -182,3 +182,28 @@ type PathsPreviewResponse struct {
 	Epoch      int    `json:"epoch"`
 	EncListing string `json:"enc_listing"` // base64 AES-GCM of pathbrowser.Listing JSON
 }
+
+// BrowseRequest is the server -> agent browse message per
+// docs/components/log-source-config.md. Unlike the legacy
+// PathsPreviewRequest, the payload is E2E encrypted with the agent DEK so
+// the server never sees browsed paths or unit names (spec section 6.3).
+// Decrypted payload JSON:
+//
+//	{"action":"list_directory","path":"/var/log/nginx"}
+//	{"action":"list_units"}
+type BrowseRequest struct {
+	Type       string `json:"type"`        // always "browse_request"
+	RequestID  string `json:"request_id"`
+	EncPayload string `json:"enc_payload"` // base64(nonce || AES-256-GCM ciphertext || tag)
+}
+
+// BrowseResponse is the agent -> server reply with the encrypted result.
+// Epoch tells the dashboard which key epoch to decrypt with, mirroring
+// PathsPreviewResponse. Decrypted payload shapes live in internal/browse
+// (DirectoryPayload / UnitsPayload / ErrorPayload).
+type BrowseResponse struct {
+	Type       string `json:"type"` // always "browse_response"
+	RequestID  string `json:"request_id"`
+	Epoch      int    `json:"epoch"`
+	EncPayload string `json:"enc_payload"`
+}

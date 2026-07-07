@@ -503,3 +503,45 @@ func TestConnectionPayloadOpacity(t *testing.T) {
 		}
 	}
 }
+
+func TestConnectionBrowseCallback(t *testing.T) {
+	ts := newTestServer(protocol.PaceConfig{IntervalMS: 0, CollectMS: 10000})
+	server := httptest.NewServer(http.HandlerFunc(ts.handler))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/agent/stream"
+	conn := NewConnection(wsURL, "test-token", "agt_test", "test")
+
+	connected := make(chan struct{}, 1)
+	conn.OnConnected(func(pace protocol.PaceConfig) {
+		connected <- struct{}{}
+	})
+
+	browsed := make(chan protocol.BrowseRequest, 1)
+	conn.OnBrowse(func(req protocol.BrowseRequest) {
+		browsed <- req
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go conn.Run(ctx)
+
+	<-connected
+
+	// Server relays an encrypted browse request — the payload stays opaque.
+	ts.sendToAll(protocol.BrowseRequest{
+		Type:       "browse_request",
+		RequestID:  "br_test_1",
+		EncPayload: "b64opaque==",
+	})
+
+	select {
+	case req := <-browsed:
+		if req.RequestID != "br_test_1" || req.EncPayload != "b64opaque==" {
+			t.Errorf("unexpected browse request: %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for browse callback")
+	}
+}

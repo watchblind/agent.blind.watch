@@ -62,6 +62,7 @@ type Connection struct {
 	onConnected        func(pace protocol.PaceConfig)
 	onDEKRotated       func(newEpoch int)
 	onPathsPreview     func(req protocol.PathsPreviewRequest)
+	onBrowse           func(req protocol.BrowseRequest)
 	onUpdateAvailable  func(version string)
 	onProvisionRevoked func(reason string)
 }
@@ -112,6 +113,7 @@ func (c *Connection) OnDisconnect(fn func(reason string))                  { c.o
 func (c *Connection) OnConnected(fn func(pace protocol.PaceConfig))        { c.onConnected = fn }
 func (c *Connection) OnDEKRotated(fn func(newEpoch int))                   { c.onDEKRotated = fn }
 func (c *Connection) OnPathsPreview(fn func(protocol.PathsPreviewRequest)) { c.onPathsPreview = fn }
+func (c *Connection) OnBrowse(fn func(protocol.BrowseRequest))              { c.onBrowse = fn }
 func (c *Connection) OnUpdateAvailable(fn func(version string))             { c.onUpdateAvailable = fn }
 func (c *Connection) OnProvisionRevoked(fn func(reason string))             { c.onProvisionRevoked = fn }
 
@@ -467,6 +469,15 @@ func (c *Connection) handleMessage(data []byte) {
 		var msg protocol.PathsPreviewRequest
 		if json.Unmarshal(data, &msg) == nil && c.onPathsPreview != nil {
 			go c.onPathsPreview(msg)
+		}
+
+	case "browse_request":
+		// Concurrency limiting (max 2 in flight) and the 5s work timeout are
+		// enforced by the browse handler, which owns the crypto needed to
+		// return the encrypted "too many concurrent browse requests" error.
+		var msg protocol.BrowseRequest
+		if json.Unmarshal(data, &msg) == nil && c.onBrowse != nil {
+			go c.onBrowse(msg)
 		}
 
 	case "update_available":
